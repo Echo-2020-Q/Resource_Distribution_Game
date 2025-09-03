@@ -25,8 +25,8 @@ class Params:
     sigma: float = 0.25             # Loner 的单边互动收益 σ（每个邻边都拿 σ）
     alpha:float = 1.0               # 每回合的固定损耗参数
     gamma:float= 10                  #阈值
-    beta:float=0.1                  #超出阈值后每回合的消费
-    Min_Res:float = -1000000              #最低的资源值
+    beta:float=0.1                  #超出阈值后每回合消费当前资源的比例
+    Min_Res:float = -10000              #最低的资源值
     kappa: float = 0.1              # 费米学习规则 κ
     learn_signal: str = "cumulative"     # "round"=学本回合收益；"cumulative"=学累计资源
     seed: Optional[int] = 42        # 随机种子（可设为 None）
@@ -100,14 +100,27 @@ def von_neumann_neighbors(i: int, j: int, L: int) -> List[Tuple[int, int]]:
     ]
 
 def gini_coefficient(x: np.ndarray) -> float:
-    """计算 Gini 系数（x >= 0）。"""
+    """允许负值的 Gini：用平均绝对值归一化"""
     x = x.flatten().astype(float)
     if np.all(x == 0):
         return 0.0
-    x_sorted = np.sort(x)
-    n = x_sorted.size
-    cumx = np.cumsum(x_sorted)
-    return (n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n
+    mean_abs = np.mean(np.abs(x))
+    n = len(x)
+    diff_sum = np.sum(np.abs(x[:, None] - x[None, :]))
+    return diff_sum / (2 * n**2 * mean_abs)
+
+def gini_coefficient_allow_negative(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float).ravel()
+    # 兜底处理非有限值，避免后续可视化报错
+    if not np.isfinite(x).all():
+        x = np.nan_to_num(x, nan=0.0)
+    mean_abs = np.mean(np.abs(x))
+    if mean_abs < 1e-12:
+        return 0.0
+    n = x.size
+    diff_sum = np.sum(np.abs(x[:, None] - x[None, :]))
+    return diff_sum / (2 * n * n * mean_abs)
+
 
 # ============ 主仿真类 ============
 class SpatialGame:
@@ -197,18 +210,39 @@ class SpatialGame:
 
     def _fermi_update(self, round_payoff: np.ndarray, frozen_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        费米学习（同步更新）。frozen_mask=True 的格子本回合不更新策略（保持原样）。
+        费米学习（同步更新）。
+        - 当 p.learn_signal == "per_strategy" 时：
+            C 用累计资源 self.res
+            D 用本回合收益 round_payoff
+            L 用 0.5*(self.res + round_payoff)
+        - 否则沿用原逻辑："round" / "cumulative"
+        frozen_mask=True 的格子本回合不更新策略（保持为 L）。
         """
         kappa = max(self.p.kappa, 1e-8)
         next_strat = self.strat.copy()
 
-        # 选择学习信号
-        if self.p.learn_signal == "round":
-            S = round_payoff
-        elif self.p.learn_signal == "cumulative":
-            S = self.res
+        # 预先构造按策略混合的学习信号矩阵 S_eff
+        if self.p.learn_signal == "per_strategy":
+            S_cum = self.res
+            S_round = round_payoff
+            S_mix = 0.5 * (S_cum + S_round)
+
+            S_eff = np.empty_like(self.res, dtype=float)
+            S_eff[self.strat == C] = S_cum[self.strat == C]
+            S_eff[self.strat == D] = S_round[self.strat == D]
+            # 说明：即使初始为 CD，也可能因为 allow_forced_l_in_cd 而出现 L
+            if (self.include_loner or self.p.allow_forced_l_in_cd) and np.any(self.strat == L):
+                S_eff[self.strat == L] = S_mix[self.strat == L]
+            # 若确实不存在 L，S_eff 中对应位置不会被访问到，不影响
+            S = S_eff
         else:
-            raise ValueError("learn_signal must be 'round' or 'cumulative'")
+            # 旧行为保持兼容
+            if self.p.learn_signal == "round":
+                S = round_payoff
+            elif self.p.learn_signal == "cumulative":
+                S = self.res
+            else:
+                raise ValueError("learn_signal must be 'round', 'cumulative', or 'per_strategy'")
 
         # 若未提供冻结掩码，视为全 False
         if frozen_mask is None:
@@ -216,17 +250,12 @@ class SpatialGame:
 
         for i in range(self.L):
             for j in range(self.L):
-                # 本回合刚被强制转L的个体：跳过更新
+                # 刚被强制转 L 的个体：跳过更新，保持 L
                 if frozen_mask[i, j]:
                     next_strat[i, j] = L
                     continue
 
-                # （可选）若你还想让已经是 L 的个体也不学习，可在此处再加：
-                # if self.strat[i, j] == L:
-                #     next_strat[i, j] = L
-                #     continue
-
-                # 随机挑邻居
+                # 随机挑邻居并比较学习信号
                 ni, nj = von_neumann_neighbors(i, j, self.L)[np.random.randint(4)]
                 Si, Sj = S[i, j], S[ni, nj]
 
@@ -271,7 +300,7 @@ class SpatialGame:
         frac_D = np.mean(self.strat == D)
         frac_L = np.mean(self.strat == L) if (self.include_loner or self.p.allow_forced_l_in_cd) else 0.0
         avg_res = float(np.mean(self.res))
-        gini = gini_coefficient(self.res.clip(min=0.0))
+        gini = gini_coefficient(self.res)
         self.history["t"].append(t)
         self.history["frac_C"].append(frac_C)
         self.history["frac_D"].append(frac_D)
@@ -300,7 +329,7 @@ class SpatialGame:
             res_after_gain = res_old + round_payoff
 
             # (2) 统一消耗（阈值规则）
-            cost = self.p.gamma
+            cost = self.p.alpha
             low_mask = (res_after_gain <= self.p.gamma)  # 低资源：减固定 cost
             res_after_consume = np.where(low_mask,
                                          res_after_gain - cost,
@@ -329,7 +358,7 @@ class SpatialGame:
                 frac_D = float(np.mean(self.strat == D))
                 frac_L = float(np.mean(self.strat == L)) if (self.include_loner or self.p.allow_forced_l_in_cd) else 0.0
                 avg_res = float(np.mean(self.res))
-                gini = gini_coefficient(self.res.clip(min=0.0))
+                gini = gini_coefficient(self.res)
                 print(
                     f"[snapshot @ t={t}] C={frac_C:.3f} D={frac_D:.3f} L={frac_L:.3f} avg_res={avg_res:.3f} gini={gini:.3f}")
 
@@ -402,18 +431,18 @@ class SpatialGame:
 if __name__ == "__main__":
     # 例 1：仅 C、D 起始；允许破产者强制转 L；学“本回合收益”
     p_cd = Params(
-        Lsize=60, T=10000,
-        fc=0.5, fd=0.5, fL=None,     # fL=None => 仅 CD 起始
-        pi0=10,                      #初始资源
-        r=1.8, sigma=0.25,           #r是背叛诱惑系数 sigma是Loner的低保收入
-        kappa=0.1,                   #费米学习因子
-        learn_signal="cumulative",
-        seed=0,
-        measure_every=10, #每多少回合记录一次统计
-        allow_forced_l_in_cd=False,   # 资源耗尽者将变为 L
-        snapshot_every=20,  # 每 20 回合一张
-        snapshot_dir="snapshots_cd",  # 输出目录
-        show_snapshots=True  # 不弹窗，只保存文件
+        Lsize = 60, T = 10000,
+        fc = 0.5, fd = 0.5, fL = None,     # fL=None => 仅 CD 起始
+        pi0 = 5,                      #初始资源
+        r = 1.6, sigma = 0.25,           #r是背叛诱惑系数 sigma是Loner的低保收入
+        kappa = 1,                   #费米学习因子
+        learn_signal = "cumulative",#per_strategy round cumulative
+        seed = 0,
+        measure_every = 10, #每多少回合记录一次统计
+        allow_forced_l_in_cd = False,   # 资源耗尽者将变为 L
+        snapshot_every = -1,  # 每 20 回合一张
+        snapshot_dir = "snapshots_cd",  # 输出目录
+        show_snapshots = True  # 不弹窗，只保存文件
     )
     sim_cd = SpatialGame(p_cd)
     hist_cd = sim_cd.run()

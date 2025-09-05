@@ -27,7 +27,7 @@ class Params:
     gamma:float= 10                  #阈值
     beta:float=0.1                  #超出阈值后每回合消费当前资源的比例
     Min_Res:float = -10000              #最低的资源值
-    kappa: float = 0.1              # 费米学习规则 κ
+    kappa: float = 1              # 费米学习规则 κ
     learn_signal: str = "cumulative"     # "round"=学本回合收益；"cumulative"=学累计资源
     seed: Optional[int] = 42        # 随机种子（可设为 None）
     measure_every: int = 1          # 每多少回合记录一次统计
@@ -39,28 +39,49 @@ class Params:
 # ============ 工具函数 ============
 def _viewer_process(q: Queue):
     import matplotlib
-    matplotlib.use("TkAgg")
+    matplotlib.use("TkAgg")  # 保持和你原来一致；有 Qt 的话可换成 "QtAgg" 更稳
     import matplotlib.pyplot as plt
+    import os
+
+    # 只创建一次窗口/坐标轴
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+    ax.axis("off")
+    im = None
+    title = ax.set_title("")
+
+    # 非阻塞显示，后续用 pause 刷新
+    plt.show(block=False)
 
     while True:
         fname = q.get()
         if fname is None:
             break
+        if not os.path.exists(fname):
+            continue
 
-        arr = plt.imread(fname)
-        h, w = arr.shape[:2]   # 图像高、宽（像素）
+        try:
+            arr = plt.imread(fname)
+            h, w = arr.shape[:2]
 
-        # ==== 自动调节窗口大小 ====
-        dpi = 100              # 分辨率，可改大/小
-        scale = 1.0            # 比例因子，调节窗口大小
-        figsize = (w / dpi * scale, h / dpi * scale)
+            if im is None:
+                # 首帧时把窗口尺寸调到和当前图像像素大致匹配
+                dpi = fig.dpi
+                fig.set_size_inches(w / dpi, h / dpi, forward=True)
+                im = ax.imshow(arr, interpolation="nearest")
+            else:
+                # 后续只更新像素，不再新建对象
+                im.set_data(arr)
+                # 若图像尺寸变化，更新坐标范围防止拉伸
+                ax.set_xlim(0, w - 1)
+                ax.set_ylim(h - 1, 0)
 
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-        ax.imshow(arr)
-        ax.axis("off")
-        ax.set_title(fname)
+            title.set_text(fname)
+            fig.canvas.draw_idle()
+            plt.pause(0.001)   # 让 GUI 事件循环处理刷新
+        except Exception as e:
+            print(f"[viewer] error: {e}")
 
-        plt.show()  # 阻塞，直到关闭窗口
+    plt.close(fig)
 
 
 
@@ -179,6 +200,26 @@ class SpatialGame:
 
             atexit.register(_cleanup)
 
+    def build_payoff_matrix(include_loner: bool, r: float, sigma: float) -> np.ndarray:
+        """
+        返回行玩家的收益矩阵 M，M[row_strategy, col_strategy]。
+        - 仅 CD：[[1, 0],
+                 [r, 0]]
+        - CDL： [[1,   0,   sigma],   # C 遇 L 也拿 sigma
+                 [r,   0,   sigma],   # D 遇 L 也拿 sigma
+                 [sigma, sigma, sigma]]  # L 对任意都拿 sigma
+        """
+        if include_loner:
+            return np.array([
+                [1.0, 0.0, sigma],
+                [r, 0.0, sigma],
+                [sigma, sigma, sigma],
+            ], dtype=float)
+        else:
+            return np.array([
+                [1.0, 0.0],
+                [r, 0.0],
+            ], dtype=float)
 
     def _init_strategies(self) -> np.ndarray:
         L2 = self.L * self.L
@@ -291,8 +332,8 @@ class SpatialGame:
                 self.strat[need_force_mask] = L
                 # 记录“刚被强制转L”的个体
                 self.just_forced_L[need_force_mask] = True
-            # 无论是否允许出现 L，都把破产者资源钉成 0（避免负值）
-            self.res[broke_mask] = 0.0
+                # 无论是否允许出现 L，都把破产者资源钉成 0（避免负值）
+                self.res[broke_mask] = 0.0
 
     def _stats(self, t: int):
         L2 = self.L * self.L
@@ -433,16 +474,16 @@ if __name__ == "__main__":
     p_cd = Params(
         Lsize = 60, T = 10000,
         fc = 0.5, fd = 0.5, fL = None,     # fL=None => 仅 CD 起始
-        pi0 = 5,                      #初始资源
-        r = 1.6, sigma = 0.25,           #r是背叛诱惑系数 sigma是Loner的低保收入
-        kappa = 1,                   #费米学习因子
-        learn_signal = "cumulative",#per_strategy round cumulative
+        pi0 = 5,                           #初始资源
+        r = 1.8, sigma = 0.25,             #r是背叛诱惑系数 sigma是Loner的低保收入
+        kappa = 1,                         #费米学习因子
+        learn_signal = "cumulative",       #per_strategy round cumulative
         seed = 0,
-        measure_every = 10, #每多少回合记录一次统计
-        allow_forced_l_in_cd = False,   # 资源耗尽者将变为 L
-        snapshot_every = -1,  # 每 20 回合一张
-        snapshot_dir = "snapshots_cd",  # 输出目录
-        show_snapshots = True  # 不弹窗，只保存文件
+        measure_every = 10,                #每多少回合记录一次统计
+        allow_forced_l_in_cd = True,       # 资源耗尽者将变为 L
+        snapshot_every = 100,               # 每 20 回合一张
+        snapshot_dir = "snapshots_cd",     # 输出目录
+        show_snapshots = False           # 不弹窗，只保存文件
     )
     sim_cd = SpatialGame(p_cd)
     hist_cd = sim_cd.run()

@@ -13,6 +13,11 @@ matplotlib.use("Agg")  # 服务器/无显示环境安全存图
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, TwoSlopeNorm
 from matplotlib.ticker import ScalarFormatter, FormatStrFormatter
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm   # 用 auto 适配 PyCharm/Jupyter/终端
 
 
 # ===== 策略编码 =====
@@ -41,12 +46,14 @@ class Params:
 
 
 # ===== 工具 =====
+
+
 def build_payoff_matrix(include_loner: bool, r: float, sigma: float) -> np.ndarray:
     if include_loner:
         return np.array([
-            [1.0, 0.0, 0.0],
-            [r, 0.0, 0.0],
-            [sigma, sigma, sigma],
+            [1.0    , 0.0   , 0.0   ],
+            [r      , 0.0   , 0.0   ],
+            [sigma  , sigma , sigma ],
         ], dtype=float)
     else:
         return np.array([
@@ -66,6 +73,22 @@ def gini_allow_negative(x: np.ndarray) -> float:
     diff_sum = np.sum(np.abs(x[:, None] - x[None, :]))
     return diff_sum / (2 * n * n * mean_abs)
 
+def _progress_consumer_thread(q: "mp.Queue", total_ticks: int, desc: str = "Sweep (config×replica)"):
+    """
+    从队列 q 中持续读取“1”并累加到 tqdm 进度。
+    预期收到 total_ticks 次 put(1) 后自动结束。
+    """
+    done = 0
+    pbar = tqdm(total=total_ticks, desc=desc, dynamic_ncols=True, mininterval=0.2, smoothing=0)
+    while done < total_ticks:
+        try:
+            q.get()  # 阻塞直到收到一个心跳
+            done += 1
+            pbar.update(1)
+        except Exception:
+            # 极端情况下（比如主进程关闭）直接跳出
+            break
+    pbar.close()
 
 # ====== 向量化邻居工具（周期边界）======
 def rolled(arr: np.ndarray):
@@ -123,6 +146,94 @@ class SpatialGameFast:
         if self.out_dir:
             os.makedirs(self.out_dir, exist_ok=True)
 
+    # === 新增：把关键参数拼成短标签，用于标题/文件名 ===
+    def _short_name(self, base_name: str) -> str:
+        """
+        Windows 路径过长时，生成短文件名；并把完整标签写到一个 .tag.txt 旁注里。
+        """
+        import hashlib
+        p = self.p
+        digest = hashlib.md5(base_name.encode("utf-8")).hexdigest()[:8]
+        short = f"trend_CDL_L{p.Lsize}_T{p.T}_r{p.r}_pi{p.pi0}_k{p.kappa}_A{int(bool(p.allow_forced_l_in_cd))}_{digest}.png"
+        return short
+
+    def _safe_savefig(self, fig, base_name: str):
+        # 确保目录存在（即使上游建过，这里再稳一手）
+        if self.out_dir:
+            os.makedirs(self.out_dir, exist_ok=True)
+        save_path = os.path.join(self.out_dir, base_name)
+        try:
+            fig.savefig(save_path, bbox_inches="tight")
+            return save_path
+        except OSError as e:
+            # Windows 超长路径兜底：换短文件名 + 写旁注
+            short = self._short_name(base_name)
+            short_path = os.path.join(self.out_dir, short)
+            fig.savefig(short_path, bbox_inches="tight")
+            note = short_path[:-4] + ".tag.txt"
+            with open(note, "w", encoding="utf-8") as f:
+                f.write(base_name + "\n")
+            return short_path
+
+    def _param_tag(self) -> str:
+        p = self.p
+        tag = (
+            f"L={p.Lsize}_T={p.T}_pi0={p.pi0}_r={p.r}_sigma={p.sigma}_"
+            f"alpha={p.alpha}_gamma={p.gamma}_beta={p.beta}_kappa={p.kappa}_"
+            f"learn={p.learn_signal}_seed={p.seed}_allowL={int(bool(p.allow_forced_l_in_cd))}"
+        )
+        return tag
+
+    # === 新增：绘制 CDL 变化曲线（以及可选的 avg_res / gini） ===
+    def _plot_trend_image(self):
+        if not (self.out_dir and self._ts):
+            return
+        import matplotlib.pyplot as plt
+
+        arr = np.asarray(self._ts, dtype=float)
+        t = arr[:, 0]
+        frac_C, frac_D, frac_L = arr[:, 1], arr[:, 2], arr[:, 3]
+        avg_res, gini = arr[:, 4], arr[:, 5]
+
+        fig = plt.figure(figsize=(8.8, 5.0), dpi=140)
+        ax = plt.gca()
+
+        ax.plot(t, frac_C, label="C (Cooperator)", linewidth=2)
+        ax.plot(t, frac_D, label="D (Defector)", linewidth=2)
+        ax.plot(t, frac_L, label="L (Loner)", linewidth=2)
+
+        ax.set_xlabel("t (round)")
+        ax.set_ylabel("fraction")
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", ncol=3, frameon=False)
+
+        # 右侧叠加 avg_res（更直观对照资源变化）
+        ax2 = ax.twinx()
+        ax2.plot(t, avg_res, linestyle="--", linewidth=1.5)
+        ax2.set_ylabel("avg_res (right)")
+        # 也可按需再叠加 gini：把下一行注释取消即可
+        # ax2.plot(t, gini, linestyle=":", linewidth=1.5)
+
+        # 标题含参数摘要
+        tag = self._param_tag()
+        plt.title(f"CDL Trend & avg_res  |  {tag}")
+        plt.gcf().text(0.01, 0.99, tag, ha="left", va="top", fontsize=8, alpha=0.8)#保存名字
+
+        # 输出路径：含参数摘要，便于 sweep 后检索
+        fname = f"trend_CDL_{tag}.png".replace("/", "_")
+        plt.tight_layout()
+        self._safe_savefig(fig, fname)
+        plt.close(fig)
+
+
+    # === 小封装：在写完 CSV 后顺手出图 ===
+    def _dump_trend_png(self):
+        try:
+            self._plot_trend_image()
+        except Exception as e:
+            # 出图失败不影响主流程（例如无 GUI 环境）
+            print(f"[warn] plot trend failed: {e}")
 
     def _fractions(self):
         frac_C = float(np.mean(self.strat == C))
@@ -139,7 +250,7 @@ class SpatialGameFast:
 
     def _plot_strategy_map(self, t, fname):
         # 颜色：C=蓝，D=红，L=灰（如果没启 L，L 不会出现）
-        cmap = ListedColormap(["#1f77b4", "#d62728", "FFFF00"])
+        cmap = ListedColormap(["#1f77b4", "#d62728", "#FFFF00"])
         plt.figure(figsize=(5.4, 5.4), dpi=120)
         plt.imshow(self.strat, cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
         plt.title(f"Strategy map @ t={t}")
@@ -201,7 +312,8 @@ class SpatialGameFast:
         plt.axis("off")
         plt.tight_layout()
         plt.savefig(fname, bbox_inches="tight")
-        plt.close()
+        plt.close('all')
+
 
     def _maybe_snapshot_plots(self, t):
         if not (self.save_plots and self.out_dir):
@@ -252,7 +364,8 @@ class SpatialGameFast:
         low_mask = (res_after_gain <= self.p.gamma)
         res_after_consume = np.where(low_mask,
                                      res_after_gain - self.p.alpha,
-                                     (1.0 - self.p.beta) * res_after_gain)
+                                     res_after_gain - self.p.alpha- (res_after_gain - self.p.gamma) * self.p.beta
+                                    )
         # 软下限：若会低于 Min_Res，则回退到旧值（在 caller 里做）
         return res_after_consume
 
@@ -301,7 +414,7 @@ class SpatialGameFast:
         只有在Loner允许的情况下，当前破产者资源均才会被钉为 0
         """
         self.just_forced_L[:] = False
-        broke_now = (self.res < 0.0)
+        broke_now = (self.res < -0.1)
 
         if not np.any(broke_now):
             return
@@ -314,6 +427,7 @@ class SpatialGameFast:
             if np.any(need_force):
                 self.strat[need_force] = L
                 self.just_forced_L[need_force] = True
+                self.res[need_force] = 0.0     # ← 只清这些位置，保持 self.res 为 2D 数组
 
     def run(self) -> Dict[str, float]:
         # 只做极简统计：起始与最终
@@ -376,6 +490,9 @@ class SpatialGameFast:
 
         # —— 新增：保存时间序列 ——
         self._dump_trend_csv()
+
+        # —— 新增：绘制 CDL 曲线图 ——
+        self._dump_trend_png()
 
         return {
             "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
@@ -498,13 +615,14 @@ def main():
 import os, csv, time, itertools
 import numpy as np
 import multiprocessing as mp
-import tqdm
+
 
 # ---- 1) 定义你想扫的参数网格（自行改动） ----
 GRID = {
-    "r":                    [1.2, 1.4, 1.6, 1.8,2.0],
+    "r":                    [1.2, 1.4, 1.6, 1.8, 2.0],
     "allow_forced_l_in_cd": [True , False],
-    "pi0":                  [5, 6, 7, 8, 9, 10]
+    "pi0":                  [ 5,  10],
+    "kappa":                [ 0.1 , 0.5 ,1 ]
 
     #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
     # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
@@ -520,8 +638,8 @@ BASE = Params(
     pi0=5.0,    # 初始资源 π0（所有玩家相同）
     sigma=0.25, # Loner 的单边互动收益 σ（每个邻边都拿 σ）
     alpha=1.0,   # 每回合的固定损耗参数
-    gamma=10.0,  #阈值
-    beta = 0.1,  # 超出阈值后每回合消费当前资源的比例
+    gamma=20.0,  #阈值
+    beta = 0.1,  # 超出阈值后每回合消费当前资源的比例0.1
     Min_Res=-10000.0,   #最低的资源值
     kappa=1,     # 费米学习规则 κ
     learn_signal="cumulative",
@@ -545,43 +663,48 @@ def iter_param_combos(grid):
 
 # ---- 3) 单次 run（带参数合并）----
 def run_one_config(args):
-    """args: (config_dict, base_params, replicas, seed_base)"""
-    cfg, base, replicas, seed0 = args
+    """
+    args: (config_dict, base_params, replicas, seed_base, q)
+    子进程在每完成 1 个 replica 后向队列 q put(1)，
+    供主进程的进度线程更新 tqdm。
+    """
+    cfg, base, replicas, seed0, q = args
     p_dict = {**base.__dict__, **cfg}
     results = []
 
-    # 构建一个图像输出目录：按参数拼路径，避免混淆
+    # 构建图像输出目录：按参数拼路径，避免混淆
     grid_name = "_".join([f"{k}={cfg[k]}" for k in sorted(cfg.keys())])
-    # 本次运行的根目录：sweep_out/<时间戳>/
     run_root = os.path.join("sweep_out", RUN_TS)
     os.makedirs(run_root, exist_ok=True)
-
-    # 每个参数组合的图像目录：sweep_out/<时间戳>/figs/<参数键值对>/
     save_root = os.path.join(run_root, "figs", grid_name)
-    os.makedirs(save_root, exist_ok=True)
-
     os.makedirs(save_root, exist_ok=True)
 
     for k in range(replicas):
         p_k = Params(**{**p_dict, "seed": (None if seed0 is None else seed0 + k)})
 
-        # 只让第一条副本出图，避免太多文件
+        # 仅首个副本出图，避免文件过多
         if k == 0:
             out_dir = os.path.join(save_root, "rep0")
             sim = SpatialGameFast(
                 p_k,
                 out_dir=out_dir,
                 log_every=max(1, p_k.T // 200),  # 约 200 个点
-                snapshots=(0.001, 0.01, 0.1, 0.5, 1.0),       # 10%、50%、100% 三张
+                snapshots=(0.001, 0.01, 0.1, 0.5, 1.0),
                 save_plots=True
             )
         else:
-            sim = SpatialGameFast(p_k)  # 其它副本不出图
+            sim = SpatialGameFast(p_k)
 
         out = sim.run()
         results.append(out)
 
-    # 聚合
+        # —— 关键：每完成 1 个 replica，就向主进程上报一次 ——
+        try:
+            q.put(1)
+        except Exception:
+            pass  # 即使队列异常也不影响仿真结果
+
+    # 聚合统计
     def agg(key):
         arr = np.array([r[key] for r in results], dtype=float)
         return float(arr.mean()), float(arr.std())
@@ -605,30 +728,48 @@ def run_one_config(args):
               "gini_mean": meanG, "gini_std": stdG,
               "cum_sigma_mean": meanCum, "cum_sigma_std": stdCum,
               "net_sum_res_mean": meanNet, "net_sum_res_std": stdNet}
-    print(f"[Config {cfg}] C={meanC:.3f}, D={meanD:.3f}, L={meanL:.3f}, "
-          f"avg_res={meanAvg:.3f}, gini={meanG:.3f}, "
-          f"cum_sigma={meanCum:.3f}, net_sum_res={meanNet:.3f}")
 
+    # 不在子进程里 print，避免 tqdm 乱序；必要的话可把日志写入 outrow 让主进程打印
     return outrow
 
 # ---- 4) 主入口（并行执行并保存CSV）----
 def main():
-    import tqdm  # tqdm.auto 也行
-
     combos = list(iter_param_combos(GRID))
-    total = len(combos)
-    print(f"Total configs: {total} × replicas {REPLICAS}")
+    n_configs = len(combos)
+    print(f"Total configs: {n_configs} × replicas {REPLICAS}")
 
-    tasks = [(cfg, BASE, REPLICAS, BASE.seed) for cfg in combos]
+    # ——— 心跳队列：子进程 put(1)，主进度条 +1
+    manager = mp.Manager()
+    prog_q = manager.Queue()
+
+    # 进度总步数 = 配置数 × 每配置的副本数
+    total_ticks = n_configs * REPLICAS
+
+    # ——— 进度线程：在主进程里运行，专门消费队列、刷新 tqdm
+    th = threading.Thread(target=_progress_consumer_thread,
+                          args=(prog_q, total_ticks, "Sweep (config×replica)"),
+                          daemon=True)
+    th.start()
+
+    # ——— 组装任务：把队列一并传给子进程
+    tasks = [(cfg, BASE, REPLICAS, BASE.seed, prog_q) for cfg in combos]
 
     t0 = time.time()
     rows = []
+    # Windows/多进程：spawn 更稳；chunksize=1 便于打散工作
     with mp.get_context("spawn").Pool(processes=N_PROCS) as pool:
-        # 用 imap_unordered 边出结果边更新进度
-        for row in tqdm.tqdm(pool.imap_unordered(run_one_config, tasks),
-                             total=total, desc="Sweep", smoothing=0.1):
+        it = pool.imap_unordered(run_one_config, tasks, chunksize=1)
+        for row in it:
             rows.append(row)
+            # 如需在主进程打印每个 config 的概要，可在这里 print（不会打乱 tqdm）
+            # print(f"[Config { {k: row[k] for k in GRID.keys()} }] "
+            #       f"C={row['frac_C_mean']:.3f}, D={row['frac_D_mean']:.3f}, "
+            #       f"L={row['frac_L_mean']:.3f}, avg_res={row['avg_res_mean']:.3f}, "
+            #       f"gini={row['gini_mean']:.3f}, net_sum_res={row['net_sum_res_mean']:.3f}")
     dt = time.time() - t0
+
+    # 等待进度线程自然结束（收到 total_ticks 个心跳后退出）
+    th.join(timeout=1.0)
 
     # ===== 保存 CSV =====
     param_keys = sorted(GRID.keys())
@@ -636,38 +777,30 @@ def main():
         "frac_C_mean", "frac_D_mean", "frac_L_mean",
         "avg_res_mean", "gini_mean", "cum_sigma_mean", "net_sum_res_mean"
     ]
-
     fieldnames = param_keys + metric_keys
 
     os.makedirs("sweep_out", exist_ok=True)
 
-    # 按 r 值排序
     rows_sorted = sorted(rows, key=lambda d: d.get("r", 0.0))
-
-    # 构造逻辑化文件名
-    # 构造逻辑化文件名（文件名前仍带时间戳，目录也带时间戳，方便检索）
     grid_name = "-".join(param_keys)
     csv_name = f"sweep_{grid_name}_T{BASE.T}_rep{REPLICAS}_{RUN_TS}.csv"
 
-    # 本次运行的根目录（和上面保持一致）
     run_root = os.path.join("sweep_out", RUN_TS)
     os.makedirs(run_root, exist_ok=True)
-
     csv_path = os.path.join(run_root, csv_name)
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        # ==== 写注释行，记录实验配置 ====
         f.write("# GRID = " + repr(GRID) + "\n")
         f.write("# BASE = " + repr(BASE) + "\n")
         f.write(f"# REPLICAS = {REPLICAS}, T = {BASE.T}\n")
 
-        # ==== 写表头和数据 ====
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in rows_sorted:
             writer.writerow({k: r.get(k, "") for k in fieldnames})
 
     print(f"Done in {dt:.1f}s. Saved: {csv_path}")
+
 
 
 

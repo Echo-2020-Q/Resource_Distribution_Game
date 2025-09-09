@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 import numpy as np
+import threading
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 import multiprocessing as mp
@@ -18,7 +19,23 @@ import numpy as np
 import multiprocessing as mp
 import threading
 from tqdm.auto import tqdm   # 用 auto 适配 PyCharm/Jupyter/终端
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+
+# ===== 线程控制（避免/利用多线程）=====
+def set_blas_threads(n: int):
+    """控制 NumPy/MKL/OpenBLAS/numexpr 的线程数。"""
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(n)
+
+def _worker_init_reduce_blas_threads():
+    """子进程 initializer：把每个子进程的 BLAS 线程数钉为 1，避免过度并行竞争。"""
+    set_blas_threads(1)
 
 # ===== 策略编码 =====
 C, D, L = 0, 1, 2  # Cooperator / Defector / Loner
@@ -45,8 +62,11 @@ class Params:
     allow_forced_l_in_cd: bool = False
     # === 新增：更新规则 ===
     update_rule: str = "fermi"  # 可选: 'fermi' / 'best_rational' / 'best_imitation'
-
-
+    # === 新增：混合学习 & 归一化设置 ===
+    eta: float = 0.5              # 混合权重：η ∈ [0,1]；最终 S = (1-η)*minmax(round) + η*minmax(cum)
+    scale_low: float = 0.0        # min–max 目标下界
+    scale_high: float = 1.0       # min–max 目标上界
+    scale_eps: float = 1e-9       # 极小跨度保护，防止除零
 # ===== 工具 =====
 
 
@@ -126,6 +146,8 @@ class SpatialGameFast:
         self.just_forced_L = np.zeros((self.L, self.L), dtype=bool)
         self.cum_sigma = 0.0   #维持Loner所要消耗的资源
         self.cum_output = 0.0  # 累计产出值（仅 C&D）
+        self.last_per_sigma = 0.0
+        self.last_per_output = 0.0
 
         # ===== 新增：输出控制 =====
         self.out_dir = out_dir
@@ -245,24 +267,30 @@ class SpatialGameFast:
         frac_L = float(np.mean(self.strat == L)) if self.include_loner else 0.0
         return frac_C, frac_D, frac_L
 
-    def _record_trend(self, t):
+    def _record_trend(self, t, per_sigma_t=0.0, per_output_t=0.0, per_net_t=0.0):
         if self.log_every > 0 and (t == 0 or t % self.log_every == 0 or t == self.p.T):
             frac_C, frac_D, frac_L = self._fractions()
             avg_res = float(np.mean(self.res))
             gini = gini_allow_negative(self.res)
 
-            # 归一化：每格每回合
             N = self.L * self.L
             if t > 0:
                 cum_sigma_hat_t = (self.cum_sigma / (N * t)) if self.include_loner else 0.0
                 cum_output_hat_t = self.cum_output / (N * t)
+                cum_net_hat_t = (self.cum_output - self.cum_sigma) / (N * t)
+
             else:
                 cum_sigma_hat_t = 0.0
                 cum_output_hat_t = 0.0
+                cum_net_hat_t = 0.0
 
-            # 在 _ts 里追加两个字段
-            self._ts.append((t, frac_C, frac_D, frac_L, avg_res, gini,
-                             cum_sigma_hat_t, cum_output_hat_t))
+            self._ts.append((
+                t, frac_C, frac_D, frac_L,
+                avg_res, gini,
+                cum_sigma_hat_t, cum_output_hat_t,  # 归一化累计（你原来就有）
+                per_sigma_t, per_output_t, per_net_t,  # ★每回合数据
+                cum_net_hat_t  # ★累计净产出（每人每回合）
+            ))
 
     def _plot_strategy_map(self, t, fname):
         # 颜色：C=蓝，D=红，L=灰（如果没启 L，L 不会出现）
@@ -346,9 +374,13 @@ class SpatialGameFast:
         csv_path = os.path.join(self.out_dir, "trend.csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["t", "frac_C", "frac_D", "frac_L",
-                        "avg_res", "gini",
-                        "cum_sigma_hat", "cum_output_hat"])  # 新增两列
+            w.writerow([
+                "t", "frac_C", "frac_D", "frac_L",
+                "avg_res", "gini",
+                "cum_sigma_hat", "cum_output_hat",
+                "per_sigma", "per_output", "per_net",
+                "cum_net_hat"
+            ])
             w.writerows(self._ts)
 
     def _init_strategies(self) -> np.ndarray:
@@ -358,12 +390,12 @@ class SpatialGameFast:
             cN = int(self.p.fc * L2)
             dN = int(self.p.fd * L2)
             lN = L2 - cN - dN
-            pool = np.array([C] * cN + [D] * dN + [L] * lN, dtype=int)
+            pool = np.array([C] * cN + [D] * dN + [L] * lN, dtype=np.uint8)  # ← 改这里
         else:
             assert abs(self.p.fc + self.p.fd - 1.0) < 1e-8, "fc+fd must be 1."
             cN = int(self.p.fc * L2)
             dN = L2 - cN
-            pool = np.array([C] * cN + [D] * dN, dtype=int)
+            pool = np.array([C] * cN + [D] * dN, dtype=np.uint8)  # ← 改这里
         np.random.shuffle(pool)
         return pool.reshape(self.L, self.L)
 
@@ -386,6 +418,43 @@ class SpatialGameFast:
                                     )
         # 软下限：若会低于 Min_Res，则回退到旧值（在 caller 里做）
         return res_after_consume
+
+    def _minmax_scale(self, X: np.ndarray, low: float = None, high: float = None) -> np.ndarray:
+        if low is None:  low = self.p.scale_low
+        if high is None: high = self.p.scale_high
+        X = np.asarray(X, dtype=float)
+        xmin = float(np.min(X));
+        xmax = float(np.max(X))
+        span = xmax - xmin
+        if not np.isfinite(xmin) or not np.isfinite(xmax) or span < self.p.scale_eps:
+            return np.zeros_like(X, dtype=float)  # 几乎常数：统一用 0，费米/Logit 比较时相当于无优势
+        Z = (X - xmin) / span
+        return Z * (high - low) + low
+
+    def _build_signal(self, round_payoff: np.ndarray) -> np.ndarray:
+        # 统一入口：根据 learn_signal 产出 S
+        if self.p.learn_signal == "round":
+            return round_payoff
+        if self.p.learn_signal == "cumulative":
+            return self.res
+        if self.p.learn_signal == "per_strategy":
+            S = np.empty_like(self.res)
+            S[self.strat == C] = self.res[self.strat == C]
+            S[self.strat == D] = round_payoff[self.strat == D]
+            maskL = (self.strat == L)
+            if np.any(maskL):
+                S[maskL] = 0.5 * (self.res[maskL] + round_payoff[maskL])
+            return S
+        if self.p.learn_signal == "hybrid":
+            # 关键：先各自min–max到同一量纲，再凸组合
+            Sr = self._minmax_scale(round_payoff)
+            Sc = self._minmax_scale(self.res)
+            eta = float(np.clip(self.p.eta, 0.0, 1.0))
+            return (1.0 - eta) * Sr + eta * Sc
+        else:
+
+            raise ValueError("learn_signal must be one of "
+                         "'round','cumulative','per_strategy','hybrid'")
 
     # ---- (3) 费米更新：一次性随机方向并向量化 ----
     def _fermi_update_vec(self, S: np.ndarray):
@@ -608,13 +677,58 @@ class SpatialGameFast:
                 self.just_forced_L[need_force] = True
                 self.res[need_force] = 0.0     # ← 只清这些位置，保持 self.res 为 2D 数组
 
+    def _plot_extra_time_series(self):
+        if not (self.out_dir and self._ts):
+            return
+        arr = np.asarray(self._ts, dtype=float)
+        t = arr[:, 0]
+
+        per_sigma = arr[:, 8]
+        per_output = arr[:, 9]
+        per_net = arr[:, 10]
+        cum_net_hat = arr[:, 11]
+
+        # 1) Loner 每回合消耗
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140);
+        ax = plt.gca()
+        ax.plot(t, per_sigma, linewidth=1.6, label="per-round σ-consumption (L)")
+        ax.set_xlabel("t");
+        ax.set_ylabel("σ per round");
+        ax.grid(True, alpha=0.3);
+        ax.legend()
+        self._safe_savefig(fig, "timeseries_per_sigma.png");
+        plt.close(fig)
+
+        # 2) 每回合净收益（产出-补贴）
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140);
+        ax = plt.gca()
+        ax.plot(t, per_net, linewidth=1.6, label="per-round net = output - σ")
+        ax.set_xlabel("t");
+        ax.set_ylabel("net per round");
+        ax.grid(True, alpha=0.3);
+        ax.legend()
+        self._safe_savefig(fig, "timeseries_per_net.png");
+        plt.close(fig)
+
+        # 3) 累计净产出（每人每回合，便于不同 L/T 可比）
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140);
+        ax = plt.gca()
+        ax.plot(t[1:], cum_net_hat[1:], linewidth=1.8, label="cumulative net (per-capita per-round)")
+        ax.set_xlabel("t");
+        ax.set_ylabel("cum net hat");
+        ax.grid(True, alpha=0.3);
+        ax.legend()
+        self._safe_savefig(fig, "timeseries_cum_net_hat.png");
+        plt.close(fig)
+
+
     def run(self) -> Dict[str, float]:
         # 只做极简统计：起始与最终
         # 初始
         # （可按需保留）init_frac_C = float(np.mean(self.strat == C))
         # 迭代
         # —— 新增：t=0 的初始点 ——
-        self._record_trend(0)
+        self._record_trend(0, 0.0, 0.0, 0.0)
         self._maybe_snapshot_plots(0)
 
         for t in range(1, self.p.T + 1):
@@ -623,14 +737,21 @@ class SpatialGameFast:
 
             # (1) 收益
             round_payoff = self._round_payoff_vec(self.strat)
-            # === 新增：累计产出值（仅 C 和 D；不含 L 的 σ） ===
+
+            # === 当回合“产出/补贴/净收益” ===
             mask_CD = (self.strat == C) | (self.strat == D)
-            self.cum_output += float(np.sum(round_payoff[mask_CD]))
-            # ================================================
-            #=== 计算维持Loner的累计消耗资源 ===
+            per_output_t = float(np.sum(round_payoff[mask_CD]))
             if self.include_loner:
                 nL = int(np.sum(self.strat == L))
-                self.cum_sigma += nL * 4.0 * self.p.sigma
+                per_sigma_t = nL * 4.0 * self.p.sigma
+            else:
+                per_sigma_t = 0.0
+            per_net_t = per_output_t - per_sigma_t
+
+            # === 累计器 ===
+            self.cum_output += per_output_t
+            self.cum_sigma += per_sigma_t
+
             res_after_gain = res_old + round_payoff
 
             # (2) 消耗
@@ -640,20 +761,8 @@ class SpatialGameFast:
             # (3) 破产转 L
             self._force_loners_if_broke()
 
-            # (4) 学习信号
-            if self.p.learn_signal == "round":
-                S = round_payoff
-            elif self.p.learn_signal == "cumulative":
-                S = self.res
-            elif self.p.learn_signal == "per_strategy":
-                S = np.empty_like(self.res)
-                S[self.strat == C] = self.res[self.strat == C]
-                S[self.strat == D] = round_payoff[self.strat == D]
-                maskL = (self.strat == L)
-                if np.any(maskL):
-                    S[maskL] = 0.5 * (self.res[maskL] + round_payoff[maskL])
-            else:
-                raise ValueError("learn_signal must be 'round'/'cumulative'/'per_strategy'")
+            # (4) 学习信号（统一入口，支持 hybrid）
+            S = self._build_signal(round_payoff)
 
             # (5) 策略更新
             if self.p.update_rule == "fermi":
@@ -671,8 +780,8 @@ class SpatialGameFast:
                                  "'fermi','best_rational','best_imitation',"
                                  "'best_imitation_logit','best_rational_logit'")
 
-            # —— 新增：记录与出图 ——
-            self._record_trend(t)
+            # —— 记录与快照 ——
+            self._record_trend(t, per_sigma_t, per_output_t, per_net_t)
             self._maybe_snapshot_plots(t)
 
         # 结束统计（保持你原来的）
@@ -699,6 +808,8 @@ class SpatialGameFast:
         self._dump_trend_csv()
         # —— 新增：绘制 CDL 曲线图 ——
         self._dump_trend_png()
+
+        self._plot_extra_time_series()
 
         return {
             "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
@@ -732,10 +843,11 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--gamma", type=float, default=10.0)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--eta", type=float, default=0.5, help="混合学习权重 η，0~1：η*round + (1-η)*cumulative（均为min–max后）")
     parser.add_argument("--minres", type=float, default=-10000.0)
     parser.add_argument("--kappa", type=float, default=0.1)
     parser.add_argument("--learn", type=str, default="cumulative",
-                        choices=["round", "cumulative", "per_strategy"])
+                        choices=["round", "cumulative", "per_strategy", "hybrid"])
     parser.add_argument(
         "--update", type=str, default="fermi",
         choices=["fermi", "best_rational", "best_imitation",
@@ -753,10 +865,21 @@ def main():
         pi0=args.pi0, r=args.r, sigma=args.sigma,
         alpha=args.alpha, gamma=args.gamma, beta=args.beta,
         Min_Res=args.minres, kappa=args.kappa,
-        learn_signal=args.learn, seed=args.seed,
+        learn_signal=args.learn,
+        eta=args.eta,
+        seed=args.seed,
         allow_forced_l_in_cd=args.allow_forced_l,
         update_rule=args.update,   # ← 新增
     )
+
+    # 根据“单次 or 并行”设置 BLAS 线程
+    if args.runs == 1:
+        # 单次长仿真：吃满 CPU
+        set_blas_threads(os.cpu_count() or 1)
+    else:
+        # 并行：每个进程限制为 1 线程（真正的扩展在进程数上）
+        set_blas_threads(1)
+
 
     if args.runs == 1:
         t0 = time.time()
@@ -767,30 +890,38 @@ def main():
             f"Final @ T={p.T}: "
             f"C={out['frac_C']:.3f}  D={out['frac_D']:.3f}  L={out['frac_L']:.3f}  "
             f"avg_res={out['avg_res']:.3f}  sum_res={out['sum_res']:.3f}  gini={out['gini']:.3f}  "
-            f"cum_sigma={out['cum_sigma']:.3f}  net_sum_res={out['net_sum_res']:.3f}"
+            f"cum_sigma={out['cum_sigma']:.3f}  cum_output={out['cum_output']:.3f}  net_output={out['net_output']:.3f}"
         )
 
+
     else:
-        # 多进程跑多次，自动使用不同种子
+        # 多进程跑多次独立重复（不同随机种子），聚合统计
         jobs = []
         for k in range(args.runs):
             pk = Params(**{**p.__dict__, "seed": (None if p.seed is None else p.seed + k)})
             jobs.append(pk)
+        N_PROCS = min(args.runs, os.cpu_count() or 1)
         t0 = time.time()
-        with mp.get_context("spawn").Pool(processes=min(args.runs, os.cpu_count() or 1)) as pool:
-            results = pool.map(run_once, jobs)
+        results = []
+        with mp.get_context("spawn").Pool(
+                processes=N_PROCS,
+                initializer=_worker_init_reduce_blas_threads,  # 每个进程把BLAS线程钉到1
+                maxtasksperchild=1  # 防止长期运行内存上涨
+        ) as pool:
+            for out in pool.imap_unordered(run_once, jobs, chunksize=1):
+                results.append(out)
         dt = time.time() - t0
 
-        # 汇总
-        arrC = np.array([r["frac_C"] for r in results])
-        arrD = np.array([r["frac_D"] for r in results])
-        arrL = np.array([r["frac_L"] for r in results])
-        arrAvg = np.array([r["avg_res"] for r in results])
-        arrSum = np.array([r["sum_res"] for r in results])
-        arrG = np.array([r["gini"] for r in results])
-        arrCum = np.array([r["cum_sigma"] for r in results])
-        arrNet = np.array([r["net_sum_res"] for r in results])
+        # ===== 聚合 =====
 
+        arrC = np.array([r["frac_C"] for r in results], dtype=float)
+        arrD = np.array([r["frac_D"] for r in results], dtype=float)
+        arrL = np.array([r["frac_L"] for r in results], dtype=float)
+        arrAvg = np.array([r["avg_res"] for r in results], dtype=float)
+        arrSum = np.array([r["sum_res"] for r in results], dtype=float)
+        arrG = np.array([r["gini"] for r in results], dtype=float)
+        arrCum = np.array([r["cum_sigma"] for r in results], dtype=float)
+        arrNet = np.array([r["net_output"] for r in results], dtype=float)
         print(f"[{args.runs} runs done in {dt:.2f}s] mean±std:")
         print(f"C={arrC.mean():.3f}±{arrC.std():.3f}  D={arrD.mean():.3f}±{arrD.std():.3f}  "
               f"L={arrL.mean():.3f}±{arrL.std():.3f}")
@@ -798,7 +929,7 @@ def main():
               f"sum_res={arrSum.mean():.3f}±{arrSum.std():.3f}  "
               f"gini={arrG.mean():.3f}±{arrG.std():.3f}  "
               f"cum_sigma={arrCum.mean():.3f}±{arrCum.std():.3f}  "
-              f"net_sum_res={arrNet.mean():.3f}±{arrNet.std():.3f}")
+              f"net_output={arrNet.mean():.3f}±{arrNet.std():.3f}")
 
 
 # if __name__ == "__main__":
@@ -837,12 +968,13 @@ import multiprocessing as mp
 
 # ---- 1) 定义你想扫的参数网格（自行改动） ----
 GRID = {
-    "r":                    [1.2, 1.4, 1.6, 1.8],
+    "r":                    [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
     "allow_forced_l_in_cd": [True, False],
     #"pi0":                  [ 5,  10],
-    "kappa":                [ 1 ],
-    "update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
-    "learn_signal":         ['round', 'cumulative' ]
+    #"kappa":                [ 1 ],
+    #"update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
+    #"learn_signal":         [ 'cumulative' ,'round'],   #"round", "cumulative", "per_strategy", "hybrid"
+    "eta":                  [0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
     #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
     # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
 }
@@ -861,17 +993,19 @@ BASE = Params(
     beta = 0.1,  # 超出阈值后每回合消费当前资源的比例0.1
     Min_Res=-10000.0,   #最低的资源值
     kappa=1,     # 费米学习规则 κ
-    learn_signal="cumulative",          # 'round' / 'cumulative' / 'per_strategy'
+    learn_signal="hybrid",          # 'round' / 'cumulative' / 'per_strategy'
     seed=0,  # 会在副本里偏移
-    allow_forced_l_in_cd=False,
-    update_rule = "fermi"  # 可选: 'fermi' / 'best_rational' / 'best_imitation'
+    allow_forced_l_in_cd = False,
+    update_rule = "best_imitation_logit"  # 可选: 'fermi' / 'best_rational' / 'best_imitation'/"best_imitation_logit","best_rational_logit"
 )
 
 # 每组参数跑多少个随机种子副本求均值
-REPLICAS = 10
+REPLICAS = 50
 
-# 并行进程数（不给就用 CPU 核心数）
-N_PROCS = min(8, os.cpu_count() or 1)
+
+# 并行进程数：用 “min(副本数, 逻辑CPU数)”，默认不再限制为 8
+N_PROCS = min(REPLICAS, os.cpu_count() or 1)
+
 
 # === 新增：本次运行的时间戳（文件夹名用） ===
 RUN_TS = time.strftime("%Y%m%d-%H%M%S")   # 例如 "20250904-1130"
@@ -939,7 +1073,7 @@ def run_one_config(args):
     meanNet, stdNet = agg("net_output")
     meanOut, stdOut = agg("cum_output")
     meanHatS, stdHatS = agg("cum_sigma_hat")
-    meanHatN, stdHatN = agg("net_sum_res_hat")
+    meanHatN, stdHatN = agg("net_output_hat")
     meanHatO, stdHatO = agg("cum_output_hat")
 
     # 返回“配置 + 统计”
@@ -951,10 +1085,13 @@ def run_one_config(args):
               "sum_res_mean": meanSum, "sum_res_std": stdSum,
               "gini_mean": meanG, "gini_std": stdG,
               "cum_sigma_mean": meanCum, "cum_sigma_std": stdCum,
-              # 新增累计产出与归一化
+              # —— 关键：把“净产出”也写入行 ——
+              "net_output_mean": meanNet, "net_output_std": stdNet,
+
+              # —— 归一化三项 ——
               "cum_output_mean": meanOut, "cum_output_std": stdOut,
               "cum_sigma_hat_mean": meanHatS, "cum_sigma_hat_std": stdHatS,
-              "net_sum_res_hat_mean": meanHatN, "net_sum_res_hat_std": stdHatN,
+              "net_output_hat_mean": meanHatN, "net_output_hat_std": stdHatN,
               "cum_output_hat_mean": meanHatO, "cum_output_hat_std": stdHatO,
               }
 
@@ -1005,11 +1142,13 @@ def main():
     metric_keys = [
         "frac_C_mean", "frac_D_mean", "frac_L_mean",
         "avg_res_mean", "gini_mean",
-        "cum_sigma_mean", "net_sum_res_mean",
-        "cum_output_mean",  # 新增
-        "cum_sigma_hat_mean",  # 新增（每格每回合）
-        "net_sum_res_hat_mean",  # 新增（每格每回合）
-        "cum_output_hat_mean"  # 新增（每格每回合）
+        "sum_res_mean",
+        "cum_sigma_mean",
+        "cum_output_mean",
+        "net_output_mean",  # ✅ 新增
+        "cum_sigma_hat_mean",
+        "cum_output_hat_mean",
+        "net_output_hat_mean",  # ✅ 新增
     ]
 
     fieldnames = param_keys + metric_keys
@@ -1035,6 +1174,53 @@ def main():
             writer.writerow({k: r.get(k, "") for k in fieldnames})
 
     print(f"Done in {dt:.1f}s. Saved: {csv_path}")
+
+    # ===== 画汇总图：按 (allow_forced_l_in_cd, r) 聚合（自动对 eta 求平均）=====
+    # 先按组聚合
+    from collections import defaultdict
+    bucket_gini = defaultdict(list)
+    bucket_net_hat = defaultdict(list)
+
+    for r in rows_sorted:
+        key = (bool(r.get("allow_forced_l_in_cd", False)), float(r.get("r", 0.0)))
+        if "gini_mean" in r:
+            bucket_gini[key].append(float(r["gini_mean"]))
+        if "net_output_hat_mean" in r:
+            bucket_net_hat[key].append(float(r["net_output_hat_mean"]))
+
+    def agg_dict(bucket):
+        out = {}
+        for (allow, rr), vals in bucket.items():
+            if len(vals):
+                out.setdefault(allow, {})[rr] = float(np.mean(vals))
+        # 每个 allow 下按 r 排序成曲线
+        for allow in out:
+            out[allow] = dict(sorted(out[allow].items(), key=lambda kv: kv[0]))
+        return out
+
+    gini_curves = agg_dict(bucket_gini)
+    net_hat_curves = agg_dict(bucket_net_hat)
+
+    def plot_curves(curves, ylabel, fname):
+        fig = plt.figure(figsize=(7.4,4.6), dpi=140); ax = plt.gca()
+        for allow, d in curves.items():
+            if not d: continue
+            xs = np.array(list(d.keys()))
+            ys = np.array(list(d.values()))
+            label = "Allow L (forced→L)" if allow else "No L"
+            ax.plot(xs, ys, marker="o", linewidth=1.8, label=label)
+        ax.set_xlabel("r"); ax.set_ylabel(ylabel); ax.grid(True, alpha=0.3); ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(run_root, fname), bbox_inches="tight")
+        plt.close(fig)
+
+    # 画两张：Gini vs r；net_output_hat vs r
+    plot_curves(gini_curves, "Gini (final)", "summary_gini_vs_r.png")
+    plot_curves(net_hat_curves, "Net output (per-capita per-round)", "summary_net_output_hat_vs_r.png")
+
+    print("Saved summary figures:",
+          os.path.join(run_root, "summary_gini_vs_r.png"), " & ",
+          os.path.join(run_root, "summary_net_output_hat_vs_r.png"))
 
 
 

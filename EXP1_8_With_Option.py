@@ -1,0 +1,1569 @@
+# expOne_Three_fast_final_stats.py
+# -*- coding: utf-8 -*-
+
+import os
+os.environ["OMP_NUM_THREADS"]="1"
+os.environ["MKL_NUM_THREADS"]="1"
+os.environ["OPENBLAS_NUM_THREADS"]="1"
+os.environ["NUMEXPR_NUM_THREADS"]="1"
+
+import numpy as np
+import threading
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
+import multiprocessing as mp
+import argparse
+import time
+import os, csv
+import matplotlib
+matplotlib.use("Agg")  # 服务器/无显示环境安全存图
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, TwoSlopeNorm
+from matplotlib.ticker import ScalarFormatter, FormatStrFormatter
+import os, csv, time, itertools
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm   # 用 auto 适配 PyCharm/Jupyter/终端
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ===== 线程控制（避免/利用多线程）=====
+def set_blas_threads(n: int):
+    """控制 NumPy/MKL/OpenBLAS/numexpr 的线程数。"""
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(n)
+
+def _worker_init_reduce_blas_threads():
+    """子进程 initializer：把每个子进程的 BLAS 线程数钉为 1，避免过度并行竞争。"""
+    set_blas_threads(1)
+
+# ===== 策略编码 =====
+C, D, L = 0, 1, 2  # Cooperator / Defector / Loner
+
+
+# ===== 参数 =====
+@dataclass
+class Params:
+    Lsize: int = 60
+    T: int = 10000
+    fc: float = 0.5
+    fd: float = 0.5
+    fL: Optional[float] = None  # None=仅CD；否则CDL
+    pi0: float = 5.0
+    r: float = 1.6
+    sigma: float = 0.25
+    alpha: float = 1.0
+    gamma: float = 10.0
+    beta: float = 0.1
+    Min_Res: float = -10000.0
+    kappa: float = 1
+    learn_signal: str = "cumulative"  # 'round' / 'cumulative' / 'per_strategy' / 'hybrid'
+    seed: Optional[int] = 0
+    allow_forced_l_in_cd: bool = False
+    # === 更新规则 ===
+    update_rule: str = "fermi"  # 可选: 'fermi' / 'best_rational' / 'best_imitation' / 'best_imitation_logit' / 'best_rational_logit'
+    # === 混合学习 & 归一化设置 ===
+    eta: float = 0.5              # 混合权重：η ∈ [0,1]；最终 S = (1-η)*minmax(round) + η*minmax(cum)
+    scale_low: float = 0.0        # min–max 目标下界
+    scale_high: float = 1.0       # min–max 目标上界
+    scale_eps: float = 1e-9       # 极小跨度保护，防止除零
+    burn_in_frac: float = 0.5     # 计算“*_mean”时跳过前 burn_in_frac*T 的回合
+    # 输出/采样控制
+    out_dir: Optional[str] = None  # None=不写；"AUTO"=runs/<ts>；也可自定义字符串
+    log_every: int = -1            # -1≈自动200点；0=不写；>=1=指定步长
+    snap_every: int = 0            # 0=用比例点(0.1/0.5/1.0)；>0=每 N 回合存一张快照图
+
+    # ===== 可选功能开关（新增）=====
+    enable_ts: bool = True                # 是否记录时间序列（_ts / trend.csv）
+    enable_trend_png: bool = True         # 是否画趋势图 trend_CDL_*.png
+    enable_timeseries_png: bool = True    # 是否画三张 timeseries_* 图
+    enable_snapshots: bool = True         # 是否保存 strat/res 快照图
+    enable_snapshot_csv: bool = True      # 是否写 snapshot.csv（随 log_every）
+    enable_gini: bool = False             # 是否在时间序列/快照里计算 gini（最终结果仍计算）
+    # 边统计模式：'none' | 'burn' | 'log' | 'log+burn' | 'always'
+    edges_mode: str = "log+burn"
+
+
+# ===== 工具 =====
+
+def build_payoff_matrix(include_loner: bool, r: float, sigma: float) -> np.ndarray:
+    if include_loner:
+        return np.array([
+            [1.0    , 0.0   , 0.0   ],
+            [r      , 0.0   , 0.0   ],
+            [sigma  , sigma , sigma ],
+        ], dtype=float)
+    else:
+        return np.array([
+            [1.0, 0.0],
+            [r, 0.0],
+        ], dtype=float)
+
+
+def gini_allow_negative(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float).ravel()
+    if not np.isfinite(x).all():
+        x = np.nan_to_num(x, nan=0.0)
+    mean_abs = np.mean(np.abs(x))
+    if mean_abs < 1e-12:
+        return 0.0
+    n = x.size
+    diff_sum = np.sum(np.abs(x[:, None] - x[None, :]))
+    return diff_sum / (2 * n * n * mean_abs)
+
+def _progress_consumer_thread(q: "mp.Queue", total_ticks: int, desc: str = "Sweep (config×replica)"):
+    """
+    从队列 q 中持续读取“1”并累加到 tqdm 进度。
+    预期收到 total_ticks 次 put(1) 后自动结束。
+    """
+    done = 0
+    pbar = tqdm(total=total_ticks, desc=desc, dynamic_ncols=True, mininterval=0.2, smoothing=0)
+    while done < total_ticks:
+        try:
+            q.get()  # 阻塞直到收到一个心跳
+            done += 1
+            pbar.update(1)
+        except Exception:
+            break
+    pbar.close()
+
+# ====== 向量化邻居工具（周期边界）======
+def rolled(arr: np.ndarray):
+    up = np.roll(arr, -1, axis=0)
+    down = np.roll(arr, 1, axis=0)
+    left = np.roll(arr, -1, axis=1)
+    right = np.roll(arr, 1, axis=1)
+    return up, down, left, right
+
+# ★★★ 四邻边类型统计 + D 周长 ★★★
+def edge_stats_four_neigh(S: np.ndarray):
+    right = np.roll(S, -1, axis=1)
+    down  = np.roll(S, -1, axis=0)
+    a1, b1 = S, right
+    a2, b2 = S, down
+
+    def cnt_pair(a,b,x,y):
+        return ((a==x)&(b==y)).sum() + ((a==y)&(b==x)).sum()
+
+    E = S.size * 2
+
+    CC = ((a1==C)&(b1==C)).sum() + ((a2==C)&(b2==C)).sum()
+    DD = ((a1==D)&(b1==D)).sum() + ((a2==D)&(b2==D)).sum()
+    LL = ((a1==L)&(b1==L)).sum() + ((a2==L)&(b2==L)).sum()
+    CD = cnt_pair(a1,b1,C,D) + cnt_pair(a2,b2,C,D)
+    CL = cnt_pair(a1,b1,C,L) + cnt_pair(a2,b2,C,L)
+    DL = cnt_pair(a1,b1,D,L) + cnt_pair(a2,b2,D,L)
+
+    D_perim = CD + DL
+    counts = dict(CC=CC, CD=CD, DD=DD, CL=CL, DL=DL, LL=LL, D_perim=D_perim, E=E)
+    ratios = {k+"_ratio": counts[k]/E for k in ["CC","CD","DD","CL","DL","LL","D_perim"]}
+    return {**counts, **ratios}
+
+# ====== 主仿真（向量化 + 开关控制）======
+class SpatialGameFast:
+    def __init__(
+            self,
+            p: Params,
+            out_dir: str = None,     # 输出目录（若为 None 则不写文件）
+            log_every: int = 0,      # >0 时记录时间序列
+            snapshots=(0.1, 0.5, 1.0),  # 相对时间点，用于出图
+            save_plots: bool = False # 是否保存分布图
+    ):
+        self.p = p
+        if p.seed is not None:
+            np.random.seed(p.seed)
+        self.L = p.Lsize
+        self.include_loner = bool(p.allow_forced_l_in_cd)
+        if not self.include_loner:
+            self.p.fL = None
+        self.M = build_payoff_matrix(self.include_loner, p.r, p.sigma)
+        self.strat = self._init_strategies()
+        self.res = np.full((self.L, self.L), fill_value=p.pi0, dtype=float)
+        self.prev_strat = self.strat.copy()
+        self.just_forced_L = np.zeros((self.L, self.L), dtype=bool)
+        self.cum_sigma = 0.0
+        self.cum_output = 0.0
+        self.last_per_sigma = 0.0
+        self.last_per_output = 0.0
+
+        # ===== 输出控制 =====
+        self.out_dir = out_dir
+        self.log_every = max(0, int(log_every))
+        self.save_plots = bool(save_plots)
+
+        # 计算快照帧（仅开启快照时）
+        snaps = set()
+        if self.save_plots and self.p.enable_snapshots:
+            for s in (snapshots or []):
+                t = int(round(self.p.T * s)) if isinstance(s, float) else int(s)
+                if 1 <= t <= self.p.T:
+                    snaps.add(t)
+            snaps.add(self.p.T)
+        else:
+            snaps.add(self.p.T)
+        self.snap_steps = sorted(snaps)
+
+        # 时间序列缓存
+        self._ts = []  # (t, frac_C, frac_D, frac_L, avg_res, gini, cum_sigma_hat, cum_output_hat, per_sigma, per_output, per_net, cum_net_hat)
+        if self.out_dir:
+            os.makedirs(self.out_dir, exist_ok=True)
+
+        # snapshot.csv（按需）
+        self._snapshot_writer = None
+        self._snapshot_file = None
+        if self.out_dir and self.log_every > 0 and self.p.enable_snapshot_csv:
+            snap_path = os.path.join(self.out_dir, "snapshot.csv")
+            self._snapshot_file = open(snap_path, "w", newline="", encoding="utf-8")
+            fields = [
+                "t","frac_C","frac_D","frac_L","avg_res","gini",
+                "per_sigma","per_output","per_net","cum_net_hat",
+                "edges_CC","edges_CD","edges_DD","edges_CL","edges_DL","edges_LL","edges_total",
+                "edges_CC_ratio","edges_CD_ratio","edges_DD_ratio","edges_CL_ratio","edges_DL_ratio","edges_LL_ratio",
+                "D_perimeter","D_perimeter_ratio"
+            ]
+            self._snapshot_writer = csv.DictWriter(self._snapshot_file, fieldnames=fields)
+            self._snapshot_writer.writeheader()
+
+        # 后半程均值累加器（burn-in）
+        self.E_per_round = 2 * (self.L ** 2)
+        self.edge_acc = {k: 0 for k in ["CC","CD","DD","CL","DL","LL","D_perim"]}
+        self.edge_samples = 0
+        self.burn_in = int(max(0.0, min(1.0, getattr(self.p, "burn_in_frac", 0.5))) * self.p.T)
+
+    # ====== 小工具：本步是否需要日志/边统计 ======
+    def _need_log_this_step(self, t: int) -> bool:
+        return self.log_every > 0 and (t == 0 or t % self.log_every == 0 or t == self.p.T)
+
+    def _need_edges_for_log(self) -> bool:
+        return self.p.edges_mode in {"log", "log+burn", "always"}
+
+    def _need_edges_for_burn(self) -> bool:
+        return self.p.edges_mode in {"burn", "log+burn", "always"}
+
+    # === 文件名兜底 ===
+    def _short_name(self, base_name: str) -> str:
+        import hashlib
+        p = self.p
+        digest = hashlib.md5(base_name.encode("utf-8")).hexdigest()[:8]
+        short = f"trend_CDL_L{p.Lsize}_T{p.T}_r{p.r}_pi{p.pi0}_k{p.kappa}_A{int(bool(p.allow_forced_l_in_cd))}_{digest}.png"
+        return short
+
+    def _safe_savefig(self, fig, base_name: str):
+        if self.out_dir:
+            os.makedirs(self.out_dir, exist_ok=True)
+        save_path = os.path.join(self.out_dir, base_name)
+        try:
+            fig.savefig(save_path, bbox_inches="tight")
+            return save_path
+        except OSError:
+            short = self._short_name(base_name)
+            short_path = os.path.join(self.out_dir, short)
+            fig.savefig(short_path, bbox_inches="tight")
+            note = short_path[:-4] + ".tag.txt"
+            with open(note, "w", encoding="utf-8") as f:
+                f.write(base_name + "\n")
+            return short_path
+
+    def _param_tag(self) -> str:
+        p = self.p
+        return (f"L={p.Lsize}_T={p.T}_pi0={p.pi0}_r={p.r}_sigma={p.sigma}_"
+                f"alpha={p.alpha}_gamma={p.gamma}_beta={p.beta}_kappa={p.kappa}_"
+                f"learn={p.learn_signal}_update={p.update_rule}_seed={p.seed}_"
+                f"allowL={int(bool(p.allow_forced_l_in_cd))}")
+
+    # === 绘制 CDL 变化曲线 ===
+    def _plot_trend_image(self):
+        if not (self.out_dir and self._ts):
+            return
+        arr = np.asarray(self._ts, dtype=float)
+        t = arr[:, 0]
+        frac_C, frac_D, frac_L = arr[:, 1], arr[:, 2], arr[:, 3]
+        avg_res = arr[:, 4]
+
+        fig = plt.figure(figsize=(8.8, 5.0), dpi=140)
+        ax = plt.gca()
+        ax.plot(t, frac_C, label="C (Cooperator)", linewidth=2)
+        ax.plot(t, frac_D, label="D (Defector)", linewidth=2)
+        ax.plot(t, frac_L, label="L (Loner)", linewidth=2)
+        ax.set_xlabel("t (round)")
+        ax.set_ylabel("fraction")
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", ncol=3, frameon=False)
+
+        ax2 = ax.twinx()
+        ax2.plot(t, avg_res, linestyle="--", linewidth=1.5)
+        ax2.set_ylabel("avg_res (right)")
+
+        tag = self._param_tag()
+        plt.title(f"CDL Trend & avg_res  |  {tag}")
+        plt.gcf().text(0.01, 0.99, tag, ha="left", va="top", fontsize=8, alpha=0.8)
+        fname = f"trend_CDL_{tag}.png".replace("/", "_")
+        plt.tight_layout()
+        self._safe_savefig(fig, fname)
+        plt.close(fig)
+
+    def _dump_trend_png(self):
+        if not self.p.enable_trend_png:
+            return
+        try:
+            self._plot_trend_image()
+        except Exception as e:
+            print(f"[warn] plot trend failed: {e}")
+
+    def _fractions(self):
+        frac_C = float(np.mean(self.strat == C))
+        frac_D = float(np.mean(self.strat == D))
+        frac_L = float(np.mean(self.strat == L)) if self.include_loner else 0.0
+        return frac_C, frac_D, frac_L
+
+    # === 记录（按需计算 gini/边统计）===
+    def _record_trend(self, t, per_sigma_t=0.0, per_output_t=0.0, per_net_t=0.0, es: dict = None):
+        frac_C, frac_D, frac_L = self._fractions()
+        avg_res = float(np.mean(self.res))
+
+        need_log = self._need_log_this_step(t)
+        need_ts_point = self.p.enable_ts and need_log
+        need_snapshot_row = (self._snapshot_writer is not None) and need_log
+
+        # gini 只在需要时计算（最终结果处会单独计算一次）
+        if self.p.enable_gini and (need_ts_point or need_snapshot_row):
+            gini_val = gini_allow_negative(self.res)
+        else:
+            gini_val = float('nan')
+
+        N = self.L * self.L
+        if t > 0:
+            cum_sigma_hat_t = (self.cum_sigma / (N * t)) if self.include_loner else 0.0
+            cum_output_hat_t = self.cum_output / (N * t)
+            cum_net_hat_t = (self.cum_output - self.cum_sigma) / (N * t)
+        else:
+            cum_sigma_hat_t = 0.0
+            cum_output_hat_t = 0.0
+            cum_net_hat_t = 0.0
+
+        if need_ts_point:
+            self._ts.append((
+                t, frac_C, frac_D, frac_L,
+                avg_res, gini_val,
+                cum_sigma_hat_t, cum_output_hat_t,
+                per_sigma_t, per_output_t, per_net_t,
+                cum_net_hat_t
+            ))
+
+        # 边统计：仅在“需要写 snapshot 且 edges_mode 包含 log”或“用于 burn 平均”时计算
+        need_edges_log = need_snapshot_row and self._need_edges_for_log()
+        need_edges_burn = self._need_edges_for_burn() and (t >= self.burn_in)
+
+        if es is None and (need_edges_log or need_edges_burn):
+            es = edge_stats_four_neigh(self.strat)
+
+        if need_snapshot_row and self.p.enable_snapshot_csv:
+            if es is None:
+                es = dict(CC=0, CD=0, DD=0, CL=0, DL=0, LL=0, D_perim=0, E=self.E_per_round,
+                          CC_ratio=0.0, CD_ratio=0.0, DD_ratio=0.0, CL_ratio=0.0, DL_ratio=0.0, LL_ratio=0.0,
+                          D_perim_ratio=0.0)
+            row = {
+                "t": t,
+                "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
+                "avg_res": avg_res, "gini": gini_val,
+                "per_sigma": per_sigma_t, "per_output": per_output_t, "per_net": per_net_t,
+                "cum_net_hat": cum_net_hat_t,
+                "edges_CC": es["CC"], "edges_CD": es["CD"], "edges_DD": es["DD"],
+                "edges_CL": es["CL"], "edges_DL": es["DL"], "edges_LL": es["LL"],
+                "edges_total": es["E"],
+                "edges_CC_ratio": es["CC_ratio"], "edges_CD_ratio": es["CD_ratio"],
+                "edges_DD_ratio": es["DD_ratio"], "edges_CL_ratio": es["CL_ratio"],
+                "edges_DL_ratio": es["DL_ratio"], "edges_LL_ratio": es["LL_ratio"],
+                "D_perimeter": es["D_perim"], "D_perimeter_ratio": es["D_perim_ratio"],
+            }
+            self._snapshot_writer.writerow(row)
+
+        if need_edges_burn and es is not None:
+            for k in ["CC","CD","DD","CL","DL","LL","D_perim"]:
+                self.edge_acc[k] += es[k]
+            self.edge_samples += 1
+
+    def _plot_strategy_map(self, t, fname):
+        cmap = ListedColormap(["#1f77b4", "#d62728", "#FFFF00"])
+        plt.figure(figsize=(5.4, 5.4), dpi=120)
+        plt.imshow(self.strat, cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
+        plt.title(f"Strategy map @ t={t}")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(fname, bbox_inches="tight")
+        plt.close()
+
+    def _plot_resource_map(self, t, fname):
+        arr = np.asarray(self.res, dtype=float)
+        if not np.isfinite(arr).all():
+            if np.isfinite(arr).any():
+                arr = np.nan_to_num(arr, nan=0.0,
+                                    posinf=np.max(arr[np.isfinite(arr)]),
+                                    neginf=np.min(arr[np.isfinite(arr)]))
+            else:
+                arr = np.zeros_like(arr)
+        vmin = float(np.nanpercentile(arr, 5))
+        vmax = float(np.nanpercentile(arr, 95))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+            vmin = float(np.min(arr)); vmax = float(np.max(arr))
+        if np.isclose(vmin, vmax, rtol=0.0, atol=1e-9):
+            center = 0.5 * (vmin + vmax)
+            span = max(1.0, abs(center) * 0.05)
+            vmin, vmax = center - span, center + span
+
+        crosses_zero = (vmin < 0.0) and (vmax > 0.0)
+        plt.figure(figsize=(5.8, 5.4), dpi=120)
+        if crosses_zero:
+            norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+            im = plt.imshow(arr, norm=norm, aspect="equal")
+        else:
+            im = plt.imshow(arr, vmin=vmin, vmax=vmax, aspect="equal")
+        cb = plt.colorbar(im, fraction=0.046, pad=0.04)
+        sf = ScalarFormatter(useOffset=False)
+        sf.set_scientific(False)
+        cb.formatter = sf
+        cb.ax.yaxis.get_offset_text().set_visible(False)
+        cb.update_ticks()
+        real_min = float(np.min(arr)); real_mu = float(np.mean(arr)); real_max = float(np.max(arr))
+        plt.title(f"Resource map @ t={t}  (min={real_min:.2f}, mean={real_mu:.2f}, max={real_max:.2f})")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(fname, bbox_inches="tight")
+        plt.close('all')
+
+    def _maybe_snapshot_plots(self, t):
+        if not (self.save_plots and self.out_dir and self.p.enable_snapshots):
+            return
+        if t in self.snap_steps:
+            sp = os.path.join(self.out_dir, f"strat_t{t:06d}.png")
+            rp = os.path.join(self.out_dir, f"res_t{t:06d}.png")
+            self._plot_strategy_map(t, sp)
+            self._plot_resource_map(t, rp)
+
+    def _dump_trend_csv(self):
+        if not (self.out_dir and self._ts):
+            return
+        csv_path = os.path.join(self.out_dir, "trend.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "t", "frac_C", "frac_D", "frac_L",
+                "avg_res", "gini",
+                "cum_sigma_hat", "cum_output_hat",
+                "per_sigma", "per_output", "per_net",
+                "cum_net_hat"
+            ])
+            w.writerows(self._ts)
+
+    def _init_strategies(self) -> np.ndarray:
+        L2 = self.L * self.L
+        if self.include_loner and (self.p.fL is not None):
+            assert abs(self.p.fc + self.p.fd + self.p.fL - 1.0) < 1e-8, "fc+fd+fL must be 1."
+            cN = int(self.p.fc * L2)
+            dN = int(self.p.fd * L2)
+            lN = L2 - cN - dN
+            pool = np.array([C] * cN + [D] * dN + [L] * lN, dtype=np.uint8)
+        else:
+            assert abs(self.p.fc + self.p.fd - 1.0) < 1e-8, "fc+fd must be 1."
+            cN = int(self.p.fc * L2)
+            dN = L2 - cN
+            pool = np.array([C] * cN + [D] * dN, dtype=np.uint8)
+        np.random.shuffle(pool)
+        return pool.reshape(self.L, self.L)
+
+    # ---- (1) 本回合收益：向量化 ----
+    def _round_payoff_vec(self, strat: np.ndarray) -> np.ndarray:
+        up, down, left, right = rolled(strat)
+        payoff = (self.M[strat, up] +
+                  self.M[strat, down] +
+                  self.M[strat, left] +
+                  self.M[strat, right])
+        return payoff
+
+    # ---- (2) 资源消耗：阈值规则（向量化）----
+    def _consume_rule(self, res_after_gain: np.ndarray) -> np.ndarray:
+        low_mask = (res_after_gain <= self.p.gamma)
+        res_after_consume = np.where(low_mask,
+                                     res_after_gain - self.p.alpha,
+                                     res_after_gain - self.p.alpha- (res_after_gain - self.p.gamma) * self.p.beta
+                                    )
+        return res_after_consume
+
+    def _minmax_scale(self, X: np.ndarray, low: float = None, high: float = None) -> np.ndarray:
+        if low is None:  low = self.p.scale_low
+        if high is None: high = self.p.scale_high
+        X = np.asarray(X, dtype=float)
+        xmin = float(np.min(X)); xmax = float(np.max(X))
+        span = xmax - xmin
+        if not np.isfinite(xmin) or not np.isfinite(xmax) or span < self.p.scale_eps:
+            return np.zeros_like(X, dtype=float)
+        Z = (X - xmin) / span
+        return Z * (high - low) + low
+
+    def _build_signal(self, round_payoff: np.ndarray) -> np.ndarray:
+        if self.p.learn_signal == "round":
+            return round_payoff
+        if self.p.learn_signal == "cumulative":
+            return self.res
+        if self.p.learn_signal == "per_strategy":
+            S = np.empty_like(self.res)
+            S[self.strat == C] = self.res[self.strat == C]
+            S[self.strat == D] = round_payoff[self.strat == D]
+            maskL = (self.strat == L)
+            if np.any(maskL):
+                S[maskL] = 0.5 * (self.res[maskL] + round_payoff[maskL])
+            return S
+        if self.p.learn_signal == "hybrid":
+            Sr = self._minmax_scale(round_payoff)
+            Sc = self._minmax_scale(self.res)
+            eta = float(np.clip(self.p.eta, 0.0, 1.0))
+            return (1.0 - eta) * Sr + eta * Sc
+        raise ValueError("learn_signal must be one of 'round','cumulative','per_strategy','hybrid'")
+
+    # ---- (3) 策略更新（多种） ----
+    def _fermi_update_vec(self, S: np.ndarray):
+        kappa = max(self.p.kappa, 1e-8)
+        s = self.strat
+        S_up, S_down, S_left, S_right = rolled(S)
+        s_up, s_down, s_left, s_right = rolled(s)
+        dir_choice = np.random.randint(0, 4, size=s.shape)
+        neighbor_S = np.where(
+            dir_choice == 0, S_up,
+            np.where(dir_choice == 1, S_down,
+                     np.where(dir_choice == 2, S_left, S_right))
+        )
+        neighbor_s = np.where(
+            dir_choice == 0, s_up,
+            np.where(dir_choice == 1, s_down,
+                     np.where(dir_choice == 2, s_left, s_right))
+        )
+        frozen = self.just_forced_L
+        delta = np.clip(S - neighbor_S, -50.0, 50.0)
+        adopt_p = 1.0 / (1.0 + np.exp(delta / kappa))
+        randu = np.random.rand(*s.shape)
+        adopt = (randu < adopt_p) & (~frozen)
+        next_s = np.where(adopt, neighbor_s, s)
+        next_s = np.where(frozen, L, next_s)
+        self.strat = next_s
+
+    def _best_imitation_logit_update_vec(self, S: np.ndarray):
+        kappa = max(self.p.kappa, 1e-12)
+        s = self.strat
+        S_up, S_down, S_left, S_right = rolled(S)
+        s_up, s_down, s_left, s_right = rolled(s)
+        neigh_payoffs = np.stack([S_up, S_down, S_left, S_right], axis=0)
+        neigh_strats = np.stack([s_up, s_down, s_left, s_right], axis=0)
+        eps = 1e-9
+        noisy = neigh_payoffs + eps * np.random.rand(*neigh_payoffs.shape)
+        argmax_idx = np.argmax(noisy, axis=0)
+        rows = np.arange(self.L)[:, None]; cols = np.arange(self.L)[None, :]
+        S_star = neigh_payoffs[argmax_idx, rows, cols]
+        strat_star = neigh_strats[argmax_idx, rows, cols]
+        Si = S
+        delta = np.clip(Si - S_star, -50.0, 50.0)
+        adopt_p = 1.0 / (1.0 + np.exp(delta / kappa))
+        randu = np.random.rand(*s.shape)
+        adopt = (randu < adopt_p) & (~self.just_forced_L)
+        next_s = np.where(adopt, strat_star, s)
+        next_s = np.where(self.just_forced_L, L, next_s)
+        self.strat = next_s
+
+    def _best_rational_logit_update_vec(self):
+        kappa = max(self.p.kappa, 1e-12)
+        up, down, left, right = rolled(self.strat)
+        A = 3 if self.include_loner else 2
+        payoffs = [(self.M[a, up] + self.M[a, down] + self.M[a, left] + self.M[a, right]) for a in range(A)]
+        U = np.stack(payoffs, axis=0)
+        eps = 1e-9
+        argmax_a = np.argmax(U + eps * np.random.rand(*U.shape), axis=0)
+        rows = np.arange(self.L)[:, None]; cols = np.arange(self.L)[None, :]
+        Ui = U[self.strat, rows, cols]; Ustar = U[argmax_a, rows, cols]
+        delta = np.clip(Ui - Ustar, -50.0, 50.0)
+        adopt_p = 1.0 / (1.0 + np.exp(delta / kappa))
+        randu = np.random.rand(self.L, self.L)
+        adopt = (randu < adopt_p) & (~self.just_forced_L)
+        next_s = np.where(adopt, argmax_a, self.strat)
+        next_s = np.where(self.just_forced_L, L, next_s)
+        self.strat = next_s
+
+    def _best_response_update_vec(self):
+        up, down, left, right = rolled(self.strat)
+        A = 3 if self.include_loner else 2
+        payoffs = [(self.M[a, up] + self.M[a, down] + self.M[a, left] + self.M[a, right]) for a in range(A)]
+        P = np.stack(payoffs, axis=0)
+        eps = 1e-9
+        P_noisy = P + eps * np.random.rand(*P.shape)
+        best = np.argmax(P_noisy, axis=0).astype(np.int64)
+        if self.include_loner:
+            best = np.where(self.just_forced_L, L, best)
+        self.strat = best
+
+    def _best_rational_update_vec(self):
+        up, down, left, right = rolled(self.strat)
+        A = 3 if self.include_loner else 2
+        payoffs = [(self.M[a, up] + self.M[a, down] + self.M[a, left] + self.M[a, right]) for a in range(A)]
+        P = np.stack(payoffs, axis=0)
+        eps = 1e-9
+        P_noisy = P + eps * np.random.rand(*P.shape)
+        best = np.argmax(P_noisy, axis=0).astype(np.int64)
+        if self.include_loner:
+            best = np.where(self.just_forced_L, L, best)
+        self.strat = best
+
+    def _best_imitation_update_vec(self, S: np.ndarray):
+        s = self.strat
+        S_up, S_down, S_left, S_right = rolled(S)
+        s_up, s_down, s_left, s_right = rolled(s)
+        neigh_payoffs = np.stack([S_up, S_down, S_left, S_right], axis=0)
+        neigh_strats  = np.stack([s_up, s_down, s_left, s_right], axis=0)
+        eps = 1e-9
+        noisy_payoffs = neigh_payoffs + eps * np.random.rand(*neigh_payoffs.shape)
+        max_idx = np.argmax(noisy_payoffs, axis=0)
+        rows = np.arange(self.L)[:, None]; cols = np.arange(self.L)[None, :]
+        best_neighbor_strat = neigh_strats[max_idx, rows, cols]
+        next_s = np.where(self.just_forced_L, L, best_neighbor_strat)
+        self.strat = next_s
+
+    def _force_loners_if_broke(self):
+        self.just_forced_L[:] = False
+        broke_now = (self.res < -0.1)
+        if not np.any(broke_now):
+            return
+        need_force = broke_now & (self.prev_strat != L)
+        if self.p.allow_forced_l_in_cd and self.include_loner:
+            if np.any(need_force):
+                self.strat[need_force] = L
+                self.just_forced_L[need_force] = True
+                self.res[need_force] = 0.0
+
+    def _plot_extra_time_series(self):
+        if not (self.out_dir and self._ts and self.p.enable_timeseries_png):
+            return
+        arr = np.asarray(self._ts, dtype=float)
+        t = arr[:, 0]
+        per_sigma = arr[:, 8]
+        per_output = arr[:, 9]
+        per_net = arr[:, 10]
+        cum_net_hat = arr[:, 11]
+
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140); ax = plt.gca()
+        ax.plot(t, per_sigma, linewidth=1.6, label="per-round σ-consumption (L)")
+        ax.set_xlabel("t"); ax.set_ylabel("σ per round"); ax.grid(True, alpha=0.3); ax.legend()
+        self._safe_savefig(fig, "timeseries_per_sigma.png"); plt.close(fig)
+
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140); ax = plt.gca()
+        ax.plot(t, per_net, linewidth=1.6, label="per-round net = output - σ")
+        ax.set_xlabel("t"); ax.set_ylabel("net per round"); ax.grid(True, alpha=0.3); ax.legend()
+        self._safe_savefig(fig, "timeseries_per_net.png"); plt.close(fig)
+
+        fig = plt.figure(figsize=(8.4, 4.4), dpi=140); ax = plt.gca()
+        ax.plot(t[1:], cum_net_hat[1:], linewidth=1.8, label="cumulative net (per-capita per-round)")
+        ax.set_xlabel("t"); ax.set_ylabel("cum net hat"); ax.grid(True, alpha=0.3); ax.legend()
+        self._safe_savefig(fig, "timeseries_cum_net_hat.png"); plt.close(fig)
+
+    # 边均值汇总
+    def _edge_means_for_summary(self) -> Dict[str, float]:
+        if self.edge_samples == 0 or self.p.edges_mode == "none":
+            nan = float('nan')
+            return {
+                "edges_CC_mean_ratio": nan, "edges_CD_mean_ratio": nan, "edges_DD_mean_ratio": nan,
+                "edges_CL_mean_ratio": nan, "edges_DL_mean_ratio": nan, "edges_LL_mean_ratio": nan,
+                "D_perimeter_mean": nan, "D_perimeter_mean_ratio": nan,
+            }
+        n = max(1, self.edge_samples)
+        E = self.E_per_round
+        mean_ratio = {f"edges_{k}_mean_ratio": self.edge_acc[k] / (E * n)
+                      for k in ["CC","CD","DD","CL","DL","LL"]}
+        return {
+            **mean_ratio,
+            "D_perimeter_mean": self.edge_acc["D_perim"] / n,
+            "D_perimeter_mean_ratio": self.edge_acc["D_perim"] / (E * n),
+        }
+
+    def run(self) -> Dict[str, float]:
+        # t=0：按需日志/边统计
+        need_log0 = self._need_log_this_step(0) and (self.p.enable_ts or (self._snapshot_writer is not None))
+        need_edges0 = (need_log0 and self._need_edges_for_log()) or (self._need_edges_for_burn() and self.burn_in <= 0)
+        es0 = edge_stats_four_neigh(self.strat) if need_edges0 else None
+        self._record_trend(0, 0.0, 0.0, 0.0, es=es0)
+        self._maybe_snapshot_plots(0)
+
+        for t in range(1, self.p.T + 1):
+            res_old = self.res.copy()
+            self.prev_strat = self.strat.copy()
+
+            # (1) 收益
+            round_payoff = self._round_payoff_vec(self.strat)
+
+            # —— 当回合“产出/补贴/净收益” ——
+            mask_CD = (self.strat == C) | (self.strat == D)
+            per_output_t = float(np.sum(round_payoff[mask_CD]))
+            if self.include_loner:
+                nL = int(np.sum(self.strat == L))
+                per_sigma_t = nL * 4.0 * self.p.sigma
+            else:
+                per_sigma_t = 0.0
+            per_net_t = per_output_t - per_sigma_t
+
+            # 累计器
+            self.cum_output += per_output_t
+            self.cum_sigma += per_sigma_t
+
+            res_after_gain = res_old + round_payoff
+
+            # (2) 消耗
+            res_after_consume = self._consume_rule(res_after_gain)
+            self.res = np.where(res_after_consume < self.p.Min_Res, res_old, res_after_consume)
+
+            # (3) 破产转 L
+            self._force_loners_if_broke()
+
+            # (4) 学习信号
+            S = self._build_signal(round_payoff)
+
+            # (5) 策略更新
+            if self.p.update_rule == "fermi":
+                self._fermi_update_vec(S)
+            elif self.p.update_rule == "best_rational":
+                self._best_rational_update_vec()
+            elif self.p.update_rule == "best_imitation":
+                self._best_imitation_update_vec(S)
+            elif self.p.update_rule == "best_imitation_logit":
+                self._best_imitation_logit_update_vec(S)
+            elif self.p.update_rule == "best_rational_logit":
+                self._best_rational_logit_update_vec()
+            else:
+                raise ValueError("update_rule must be one of: 'fermi','best_rational','best_imitation','best_imitation_logit','best_rational_logit'")
+
+            # —— 记录与快照（按需边统计） ——
+            es_t = None
+            need_edges_log = self._need_edges_for_log() and self._need_log_this_step(t) and (self._snapshot_writer is not None)
+            need_edges_burn = self._need_edges_for_burn() and (t >= self.burn_in)
+            if need_edges_log or need_edges_burn:
+                es_t = edge_stats_four_neigh(self.strat)
+
+            self._record_trend(t, per_sigma_t, per_output_t, per_net_t, es=es_t)
+            self._maybe_snapshot_plots(t)
+
+        # 结束统计
+        frac_C = float(np.mean(self.strat == C))
+        frac_D = float(np.mean(self.strat == D))
+        frac_L = float(np.mean(self.strat == L)) if self.include_loner else 0.0
+        avg_res = float(np.mean(self.res))
+        sum_res = float(np.sum(self.res))
+        gini_final = gini_allow_negative(self.res)  # 最终值仍计算
+        cum_sigma = float(self.cum_sigma)
+        cum_output = float(self.cum_output)
+        net_output = cum_output - cum_sigma
+
+        # 归一化（每格每回合）
+        N = self.L * self.L
+        T = self.p.T
+        # 关闭 snapshot.csv 文件句柄（若有）
+        if self._snapshot_file is not None:
+            try:
+                self._snapshot_file.close()
+            except Exception:
+                pass
+
+        # 保存时间序列 / 趋势图 / 额外时序图（按开关）
+        self._dump_trend_csv()
+        self._dump_trend_png()
+        self._plot_extra_time_series()
+
+        edge_summary = self._edge_means_for_summary()
+
+        return {
+            "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
+            "avg_res": avg_res, "sum_res": sum_res, "gini": gini_final,
+            "cum_sigma": cum_sigma,
+            "cum_output": cum_output,
+            "net_output": net_output,
+            "cum_sigma_hat": float(cum_sigma / (N * T)) if self.include_loner else 0.0,
+            "cum_output_hat": float(cum_output / (N * T)),
+            "net_output_hat": float(net_output / (N * T)),
+            **edge_summary,
+        }
+
+
+# ====== 单次运行的便捷函数（给并行用）======
+def run_once(p: Params) -> Dict[str, float]:
+    sim = SpatialGameFast(p)
+    return sim.run()
+
+
+# ====== CLI & 并行入口 ======
+def main():
+    parser = argparse.ArgumentParser(description="Fast spatial game (final-only stats).")
+    parser.add_argument("--L", type=int, default=60)
+    parser.add_argument("--T", type=int, default=10000)
+    parser.add_argument("--fc", type=float, default=0.5)
+    parser.add_argument("--fd", type=float, default=0.5)
+    parser.add_argument("--fL", type=float, default=-1.0, help="-1 表示仅CD；>=0表示CDL的L比例")
+    parser.add_argument("--pi0", type=float, default=5.0)
+    parser.add_argument("--r", type=float, default=1.6)
+    parser.add_argument("--sigma", type=float, default=0.25)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=10.0)
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--eta", type=float, default=0.5, help="混合学习权重 η，0~1：η*round + (1-η)*cumulative（均为min–max后）")
+    parser.add_argument("--minres", type=float, default=-10000.0)
+    parser.add_argument("--kappa", type=float, default=0.1)
+    parser.add_argument("--learn", type=str, default="cumulative",
+                        choices=["round", "cumulative", "per_strategy", "hybrid"])
+    parser.add_argument("--update", type=str, default="fermi",
+                        choices=["fermi", "best_rational", "best_imitation",
+                                 "best_imitation_logit", "best_rational_logit"],
+                        help="更新规则")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--allow_forced_l", action="store_true", help="仅CD起始时也允许破产转L")
+    parser.add_argument("--runs", type=int, default=1, help="并行独立重复次数（不同随机种子）")
+    parser.add_argument("--burn", type=float, default=0.5,
+                        help="burn-in fraction for summary means (0~1). 0=不用烧入，1=只看最后一个回合")
+    parser.add_argument("--out", type=str, default="AUTO",
+                        help="输出目录。AUTO=自动 runs/<时间戳>；空串\"\"或none=不写CSV/图；其它=自定义目录")
+    parser.add_argument("--log-every", type=int, default=-1,
+                        help="每多少回合写一行 snapshot/trend。-1=自动约200点；0=不写；>=1=指定步长")
+    parser.add_argument("--snap-every", type=int, default=0,
+                        help="每多少回合保存一次快照图（0=用比例点 0.1/0.5/1.0）")
+
+    # ===== 新增：开关 CLI =====
+    parser.add_argument("--edges", type=str, default="log+burn",
+                        choices=["none","burn","log","log+burn","always"],
+                        help="边统计模式")
+    parser.add_argument("--no-ts", action="store_true", help="不记录时间序列/不写trend.csv")
+    parser.add_argument("--no-trend-png", action="store_true", help="不画趋势图")
+    parser.add_argument("--no-timeseries-png", action="store_true", help="不画 timeseries_* 图")
+    parser.add_argument("--no-snapshots", action="store_true", help="不保存 strat/res 快照图")
+    parser.add_argument("--no-snapshot-csv", action="store_true", help="不写 snapshot.csv")
+    parser.add_argument("--enable-gini", action="store_true", help="在时间序列/快照里计算 gini（最终结果总会计算）")
+
+    args = parser.parse_args()
+
+    p = Params(
+        Lsize=args.L, T=args.T, fc=args.fc, fd=args.fd,
+        fL=None if args.fL < 0 else args.fL,
+        pi0=args.pi0, r=args.r, sigma=args.sigma,
+        alpha=args.alpha, gamma=args.gamma, beta=args.beta,
+        Min_Res=args.minres, kappa=args.kappa,
+        learn_signal=args.learn,
+        eta=args.eta,
+        seed=args.seed,
+        allow_forced_l_in_cd=args.allow_forced_l,
+        update_rule=args.update,
+        burn_in_frac=args.burn,
+        edges_mode=args.edges,
+        enable_ts=(not args.no_ts),
+        enable_trend_png=(not args.no_trend_png),
+        enable_timeseries_png=(not args.no_timeseries_png),
+        enable_snapshots=(not args.no_snapshots),
+        enable_snapshot_csv=(not args.no_snapshot_csv),
+        enable_gini=args.enable_gini,
+    )
+
+    # === 输出目录 ===
+    if args.out is None:
+        out_dir = None
+    else:
+        out_str = str(args.out).strip()
+        if out_str == "" or out_str.lower() == "none":
+            out_dir = None
+        elif out_str == "AUTO":
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            out_dir = os.path.join("runs", ts)
+        else:
+            out_dir = out_str
+
+    # === 采样频率 ===
+    if args.log_every < 0:
+        log_every = (max(1, p.T // 200) if out_dir else 0)  # AUTO≈200个点
+    else:
+        log_every = int(args.log_every)
+
+    # === 快照帧 ===
+    if args.snap_every and args.snap_every > 0:
+        snapshots = list(range(args.snap_every, p.T + 1, args.snap_every))
+    else:
+        snapshots = (0.1, 0.5, 1.0)
+
+    # 根据“单次 or 并行”设置 BLAS 线程
+    if args.runs == 1:
+        set_blas_threads(os.cpu_count() or 1)
+    else:
+        set_blas_threads(1)
+
+    if args.runs == 1:
+        out_dir_eff = out_dir
+        log_every_eff = (log_every if log_every is not None else -1)
+        if int(log_every_eff) < 0:
+            log_every_eff = (max(1, p.T // 200) if out_dir_eff else 0)
+        snapshots_eff = snapshots
+
+        if out_dir_eff and str(out_dir_eff).lower() != "none":
+            out_dir_real = (os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
+                            if str(out_dir_eff).upper() == "AUTO" else str(out_dir_eff))
+            os.makedirs(out_dir_real, exist_ok=True)
+        else:
+            out_dir_real = None
+
+        sim = SpatialGameFast(
+            p,
+            out_dir=out_dir_real,
+            log_every=int(log_every_eff),
+            snapshots=snapshots_eff,
+            save_plots=bool(out_dir_real)
+        )
+
+        t0 = time.time()
+        out = sim.run()
+        dt = time.time() - t0
+        print(f"[Single run done in {dt:.2f}s]")
+        print(
+            f"Final @ T={p.T}: "
+            f"C={out['frac_C']:.3f}  D={out['frac_D']:.3f}  L={out['frac_L']:.3f}  "
+            f"avg_res={out['avg_res']:.3f}  sum_res={out['sum_res']:.3f}  gini={out['gini']:.3f}  "
+            f"cum_sigma={out['cum_sigma']:.3f}  cum_output={out['cum_output']:.3f}  net_output={out['net_output']:.3f}"
+        )
+        if out_dir_real:
+            print(f"Saved to: {out_dir_real}")
+    else:
+        # ===== 并行：只让 rep0 写 CSV/图，其余副本只算统计 =====
+        N_PROCS = min(args.runs, os.cpu_count() or 1)
+        results = []
+        t0 = time.time()
+
+        out_dir_eff = out_dir
+        log_every_eff = (log_every if log_every is not None else -1)
+        if int(log_every_eff) < 0:
+            log_every_eff = (max(1, p.T // 200) if out_dir_eff else 0)
+        snapshots_eff = snapshots
+
+        if out_dir_eff and str(out_dir_eff).lower() != "none":
+            out_dir_root = (os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
+                            if str(out_dir_eff).upper() == "AUTO" else str(out_dir_eff))
+            rep0_dir = os.path.join(out_dir_root, "rep0")
+            os.makedirs(rep0_dir, exist_ok=True)
+        else:
+            out_dir_root = None
+            rep0_dir = None
+
+        p0 = Params(**{**p.__dict__, "seed": (None if p.seed is None else p.seed)})
+
+        sim0 = SpatialGameFast(
+            p0,
+            out_dir=rep0_dir,
+            log_every=int(log_every_eff if rep0_dir else 0),
+            snapshots=snapshots_eff,
+            save_plots=bool(rep0_dir)
+        )
+        out0 = sim0.run()
+        results.append(out0)
+
+        jobs = []
+        for k in range(1, args.runs):
+            pk = Params(**{**p.__dict__, "seed": (None if p.seed is None else p.seed + k)})
+            jobs.append(pk)
+
+        if jobs:
+            with mp.get_context("spawn").Pool(
+                    processes=min(len(jobs), N_PROCS),
+                    initializer=_worker_init_reduce_blas_threads,
+                    maxtasksperchild=1
+            ) as pool:
+                for out in pool.imap_unordered(run_once, jobs, chunksize=1):
+                    results.append(out)
+
+        dt = time.time() - t0
+
+        arrC = np.array([r["frac_C"] for r in results], dtype=float)
+        arrD = np.array([r["frac_D"] for r in results], dtype=float)
+        arrL = np.array([r["frac_L"] for r in results], dtype=float)
+        arrAvg = np.array([r["avg_res"] for r in results], dtype=float)
+        arrSum = np.array([r["sum_res"] for r in results], dtype=float)
+        arrG = np.array([r["gini"] for r in results], dtype=float)
+        arrCum = np.array([r["cum_sigma"] for r in results], dtype=float)
+        arrNet = np.array([r["net_output"] for r in results], dtype=float)
+
+        print(f"[{args.runs} runs done in {dt:.2f}s] mean±std:")
+        print(f"C={arrC.mean():.3f}±{arrC.std():.3f}  D={arrD.mean():.3f}±{arrD.std():.3f}  "
+              f"L={arrL.mean():.3f}±{arrL.std():.3f}")
+        print(f"avg_res={arrAvg.mean():.3f}±{arrAvg.std():.3f}  "
+              f"sum_res={arrSum.mean():.3f}±{arrSum.std():.3f}  "
+              f"gini={arrG.mean():.3f}±{arrG.std():.3f}  "
+              f"cum_sigma={arrCum.mean():.3f}±{arrCum.std():.3f}  "
+              f"net_output={arrNet.mean():.3f}±{arrNet.std():.3f}")
+        if rep0_dir:
+            print(f"[rep0 outputs] saved to: {rep0_dir}")
+
+
+# if __name__ == "__main__":
+#     main()
+
+
+# sweep_parallel.py
+# -*- coding: utf-8 -*-
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm
+#from expOne_Three_fast_final_stats import Params, SpatialGameFast, _worker_init_reduce_blas_threads, _progress_consumer_thread
+
+# ---- 1) 定义你想扫的参数网格（自行改动） ----
+GRID = {
+    #"r":                    [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
+    "r":   [round(x, 2) for x in np.linspace(1.0, 2.0, 51)],
+    "allow_forced_l_in_cd": [True, False],
+    #"pi0":                  [ 5,  10],
+    #"kappa":                [ 1 ],
+    #"update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
+    #"learn_signal":         [ 'cumulative' ,'round'],   #"round", "cumulative", "per_strategy", "hybrid"
+    #"eta":                  [0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
+    "eta": [round(x, 2) for x in np.linspace(0.0, 1.0, 51)],
+    #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
+    # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
+}
+
+# 固定不变的公共参数（可在此统一调参）
+BASE = Params(
+    # --- 结构/时长 ---
+    Lsize=50,
+    T=50000,
+
+    # --- 初始策略配比 ---
+    fc=0.5, fd=0.5, fL=None,
+
+    # --- 博弈参数 ---
+    r=1.6, pi0=10.0, sigma=0.25,
+    alpha=1.0, gamma=70.0, beta=0.1, Min_Res=-10000.0,
+
+    # --- 学习/更新规则 ---
+    kappa=1,
+    learn_signal="hybrid",
+    eta=0.5,
+    update_rule="best_imitation_logit",
+    allow_forced_l_in_cd=False,
+    seed=0,
+
+    # --- 归一化刻度 ---
+    scale_low=0.0, scale_high=1.0, scale_eps=1e-9,
+
+    # --- 统计均值的烧入比例 ---
+    burn_in_frac=0.5,
+
+    # --- 输出/采样控制（给 sweep 用）---
+    out_dir="AUTO",
+    log_every=50000,
+    snap_every=0,
+
+    # ===== 建议在 sweep 默认关闭重功能（需要时自行打开）=====
+    enable_ts=False,
+    enable_trend_png=False,
+    enable_timeseries_png=False,
+    enable_snapshots=False,
+    enable_snapshot_csv=False,
+    enable_gini=False,
+    edges_mode="burn"  # 只做 burn-in 段均值；若完全不要，改 "none"
+)
+
+# 每组参数跑多少个随机种子副本求均值
+REPLICAS = 50
+
+# 并行进程数
+N_PROCS = min(REPLICAS, os.cpu_count() or 1)
+
+# 本次运行的时间戳
+RUN_TS = time.strftime("%Y%m%d-%H%M%S")
+
+# ---- 2) 生成参数组合 ----
+def iter_param_combos(grid):
+    keys = list(grid.keys())
+    for values in itertools.product(*[grid[k] for k in keys]):
+        yield dict(zip(keys, values))
+
+# ---- 3) 单次 config（含多个副本）----
+def run_one_config(args):
+    """
+    args: (config_dict, base_params, replicas, seed_base, q)
+    子进程在每完成 1 个 replica 后向队列 q put(1)，用于 tqdm 进度。
+    """
+    cfg, base, replicas, seed0, q = args
+    p_dict = {**base.__dict__, **cfg}
+    results = []
+
+    # 构建图像输出目录：按参数拼路径，避免混淆
+    grid_name = "_".join([f"{k}={cfg[k]}" for k in sorted(cfg.keys())])
+    run_root = os.path.join("sweep_out", RUN_TS)
+    os.makedirs(run_root, exist_ok=True)
+    save_root = os.path.join(run_root, grid_name)
+    os.makedirs(save_root, exist_ok=True)
+
+    for k in range(replicas):
+        p_k = Params(**{**p_dict, "seed": (None if seed0 is None else seed0 + k)})
+
+        # 仅首个副本出图（若开）
+        if k == 0 and p_k.enable_trend_png:
+            out_dir = os.path.join(save_root, "rep0")
+            os.makedirs(out_dir, exist_ok=True)
+            log_every_eff = (p_k.log_every if getattr(p_k, "log_every", -1) >= 0 else max(1, p_k.T // 200))
+            snapshots_eff = (list(range(p_k.snap_every, p_k.T + 1, p_k.snap_every))
+                             if getattr(p_k, "snap_every", 0) > 0 else (0.001, 0.01, 0.1, 0.5, 1.0))
+            sim = SpatialGameFast(
+                p_k,
+                out_dir=out_dir,
+                log_every=log_every_eff,
+                snapshots=snapshots_eff,
+                save_plots=True
+            )
+        else:
+            sim = SpatialGameFast(p_k)
+
+        out = sim.run()
+        results.append(out)
+
+        try:
+            q.put(1)
+        except Exception:
+            pass
+
+    # 聚合统计
+    def agg(key):
+        arr = np.array([r[key] for r in results], dtype=float)
+        return float(arr.mean()), float(arr.std())
+
+    meanC, stdC = agg("frac_C")
+    meanD, stdD = agg("frac_D")
+    meanL, stdL = agg("frac_L")
+    meanAvg, stdAvg = agg("avg_res")
+    meanSum, stdSum = agg("sum_res")
+    meanG, stdG = agg("gini")
+    meanCum, stdCum = agg("cum_sigma")
+    meanNet, stdNet = agg("net_output")
+    meanOut, stdOut = agg("cum_output")
+    meanHatS, stdHatS = agg("cum_sigma_hat")
+    meanHatN, stdHatN = agg("net_output_hat")
+    meanHatO, stdHatO = agg("cum_output_hat")
+
+    outrow = {**cfg,
+              "frac_C_mean": meanC, "frac_C_std": stdC,
+              "frac_D_mean": meanD, "frac_D_std": stdD,
+              "frac_L_mean": meanL, "frac_L_std": stdL,
+              "avg_res_mean": meanAvg, "avg_res_std": stdAvg,
+              "sum_res_mean": meanSum, "sum_res_std": stdSum,
+              "gini_mean": meanG, "gini_std": stdG,
+              "cum_sigma_mean": meanCum, "cum_sigma_std": stdCum,
+              "net_output_mean": meanNet, "net_output_std": stdNet,
+              "cum_output_mean": meanOut, "cum_output_std": stdOut,
+              "cum_sigma_hat_mean": meanHatS, "cum_sigma_hat_std": stdHatS,
+              "net_output_hat_mean": meanHatN, "net_output_hat_std": stdHatN,
+              "cum_output_hat_mean": meanHatO, "cum_output_hat_std": stdHatO,
+              }
+    return outrow
+
+# ---- 4) 主入口（并行执行并保存CSV）----
+def main():
+    combos = list(iter_param_combos(GRID))
+    n_configs = len(combos)
+    print(f"Total configs: {n_configs} × replicas {REPLICAS}")
+    print("cpu_count=", os.cpu_count())
+    print("N_PROCS=", N_PROCS)
+
+    manager = mp.Manager()
+    prog_q = manager.Queue()
+    total_ticks = n_configs * REPLICAS
+
+    th = threading.Thread(target=_progress_consumer_thread,
+                          args=(prog_q, total_ticks, "Sweep (config×replica)"),
+                          daemon=True)
+    th.start()
+
+    tasks = [(cfg, BASE, REPLICAS, BASE.seed, prog_q) for cfg in combos]
+
+    t0 = time.time()
+    rows = []
+    with mp.get_context("spawn").Pool(processes=N_PROCS,
+                                      initializer=_worker_init_reduce_blas_threads,
+                                      maxtasksperchild=1) as pool:
+        it = pool.imap_unordered(run_one_config, tasks, chunksize=1)
+        for row in it:
+            rows.append(row)
+    dt = time.time() - t0
+    th.join(timeout=1.0)
+
+    # 保存 CSV
+    param_keys = sorted(GRID.keys())
+    metric_keys = [
+        "frac_C_mean", "frac_D_mean", "frac_L_mean",
+        "avg_res_mean", "gini_mean",
+        "sum_res_mean",
+        "cum_sigma_mean",
+        "cum_output_mean",
+        "net_output_mean",
+        "cum_sigma_hat_mean",
+        "cum_output_hat_mean",
+        "net_output_hat_mean",
+    ]
+    fieldnames = param_keys + metric_keys
+
+    os.makedirs("sweep_out", exist_ok=True)
+    rows_sorted = sorted(rows, key=lambda d: d.get("r", 0.0))
+    grid_name = "-".join(param_keys)
+    csv_name = f"sweep_{grid_name}_T{BASE.T}_rep{REPLICAS}_{RUN_TS}.csv"
+
+    run_root = os.path.join("sweep_out", RUN_TS)
+    os.makedirs(run_root, exist_ok=True)
+    csv_path = os.path.join(run_root, csv_name)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        f.write("# GRID = " + repr(GRID) + "\n")
+        f.write("# BASE = " + repr(BASE) + "\n")
+        f.write(f"# REPLICAS = {REPLICAS}, T = {BASE.T}\n")
+
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows_sorted:
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
+
+    print(f"Done in {dt:.1f}s. Saved: {csv_path}")
+
+    # ===== 画汇总图：按 (allow_forced_l_in_cd, r) 聚合（对 eta 求平均）=====
+    from collections import defaultdict
+    import matplotlib.pyplot as plt
+
+    bucket_gini = defaultdict(list)
+    bucket_net_hat = defaultdict(list)
+    for r in rows_sorted:
+        key = (bool(r.get("allow_forced_l_in_cd", False)), float(r.get("r", 0.0)))
+        if "gini_mean" in r:
+            bucket_gini[key].append(float(r["gini_mean"]))
+        if "net_output_hat_mean" in r:
+            bucket_net_hat[key].append(float(r["net_output_hat_mean"]))
+
+    def agg_dict(bucket):
+        out = {}
+        for (allow, rr), vals in bucket.items():
+            if len(vals):
+                out.setdefault(allow, {})[rr] = float(np.mean(vals))
+        for allow in out:
+            out[allow] = dict(sorted(out[allow].items(), key=lambda kv: kv[0]))
+        return out
+
+    gini_curves = agg_dict(bucket_gini)
+    net_hat_curves = agg_dict(bucket_net_hat)
+
+    def plot_curves(curves, ylabel, fname):
+        fig = plt.figure(figsize=(7.4,4.6), dpi=140); ax = plt.gca()
+        for allow, d in curves.items():
+            if not d: continue
+            xs = np.array(list(d.keys()))
+            ys = np.array(list(d.values()))
+            label = "Allow L (forced→L)" if allow else "No L"
+            ax.plot(xs, ys, marker="o", linewidth=1.8, label=label)
+        ax.set_xlabel("r"); ax.set_ylabel(ylabel); ax.grid(True, alpha=0.3); ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(run_root, fname), bbox_inches="tight")
+        plt.close(fig)
+
+    plot_curves(gini_curves, "Gini (final)", "summary_gini_vs_r.png")
+    plot_curves(net_hat_curves, "Net output (per-capita per-round)", "summary_net_output_hat_vs_r.png")
+
+    print("Saved summary figures:",
+          os.path.join(run_root, "summary_gini_vs_r.png"), " & ",
+          os.path.join(run_root, "summary_net_output_hat_vs_r.png"))
+
+
+# if __name__ == "__main__":
+#     main()
+
+# sweep_parallel.py
+# -*- coding: utf-8 -*-
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm
+
+# ---- 1) 定义你想扫的参数网格（自行改动） ----
+GRID = {
+    #"r":                    [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
+    "r":   [1.6],#[round(x, 2) for x in np.linspace(1.0, 2.0, 51)],
+    "allow_forced_l_in_cd": [True, False],
+    #"pi0":                  [ 5,  10],
+    #"kappa":                [ 1 ],
+    #"update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
+    #"learn_signal":         [ 'cumulative' ,'round'],   #"round", "cumulative", "per_strategy", "hybrid"
+    #"eta":                  [0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
+    "eta": [0.0],#[round(x, 2) for x in np.linspace(0.0, 1.0, 51)],
+    #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
+    # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
+
+}
+
+# 固定不变的公共参数（可在此统一调参）
+BASE = Params(
+    # --- 结构/时长 ---
+    Lsize=50,
+    T=50000,
+
+    # --- 初始策略配比 ---
+    fc=0.5, fd=0.5, fL=None,
+
+    # --- 博弈参数 ---
+    r=1.6, pi0=10.0, sigma=0.25,
+    alpha=1.0, gamma=70.0, beta=0.1, Min_Res=-10000.0,
+
+    # --- 学习/更新规则 ---
+    kappa=1,
+    learn_signal="hybrid",
+    eta=0.5,
+    update_rule="best_imitation_logit",
+    allow_forced_l_in_cd=False,
+    seed=0,
+
+    # --- 归一化刻度 ---
+    scale_low=0.0, scale_high=1.0, scale_eps=1e-9,
+
+    # --- 统计均值的烧入比例 ---
+    burn_in_frac=0.5,
+
+    # --- 输出/采样控制（给 sweep 用）---
+
+    # 下面这些只对我们**主动传 out_dir 的 rep0**有用；其它 replica 不写文件
+    out_dir="AUTO",
+    log_every=50000,
+    snap_every=0,
+    # ===== 建议在 sweep 默认关闭重功能（需要时自行打开）=====
+    enable_ts=True,   #是否记录时间序列并写 trend.csv
+    enable_trend_png=True, #是否画趋势图
+    enable_timeseries_png=True, #是否画三张 timeseries 图
+    enable_snapshots=True, #是否保存策略/资源快照图
+    enable_snapshot_csv=False, #是否写 snapshot.csv是否写 snapshot.csv
+    enable_gini=False, #是否在时间序列/快照里计算 gini（最终结果仍会计算）
+    edges_mode="none"  # 只做 burn-in 段均值；若完全不要，改 "none"边统计模式：'none'|'burn'|'log'|'log+burn'|'always'
+)
+
+# 每组参数跑多少个随机种子副本求均值
+REPLICAS = 50
+
+# 并行进程数
+N_PROCS = min(REPLICAS, os.cpu_count() or 1)
+
+# --- CHANGED --- 统一本次 sweep 的时间戳，只生成一次大的根目录
+RUN_TS = time.strftime("%Y%m%d-%H%M%S")
+
+def iter_param_combos(grid):
+    keys = list(grid.keys())
+    for values in itertools.product(*[grid[k] for k in keys]):
+        yield dict(zip(keys, values))
+
+# --- CHANGED --- 把 run_root 作为参数传进来，所有输出都集中到它下面
+def run_one_config(args):
+    """
+    args: (config_dict, base_params, replicas, seed_base, q, run_root)
+    子进程每完成 1 个 replica 就向队列 put(1) 以更新进度。
+    """
+    cfg, base, replicas, seed0, q, run_root = args   # --- CHANGED ---
+    p_dict = {**base.__dict__, **cfg}
+    results = []
+
+    # 以参数组合作为子文件夹名（无新的时间戳）
+    grid_name = "_".join([f"{k}={cfg[k]}" for k in sorted(cfg.keys())])
+    os.makedirs(run_root, exist_ok=True)  # 大文件夹
+    save_root = os.path.join(run_root, grid_name)
+    os.makedirs(save_root, exist_ok=True)
+
+    for k in range(replicas):
+        p_k = Params(**{**p_dict, "seed": (None if seed0 is None else seed0 + k)})
+
+        # 仅 rep0 产图/CSV，且输出到固定目录 save_root/rep0
+        if k == 0 and (p_k.enable_trend_png or p_k.enable_timeseries_png or p_k.enable_snapshots or p_k.enable_snapshot_csv or p_k.enable_ts):
+            out_dir = os.path.join(save_root, "rep0")
+            os.makedirs(out_dir, exist_ok=True)
+
+            # 自动日志频率（若未指定）
+            log_every_eff = (p_k.log_every if getattr(p_k, "log_every", -1) >= 0 else max(1, p_k.T // 200))
+
+            # 快照点（若开启）
+            snapshots_eff = (list(range(p_k.snap_every, p_k.T + 1, p_k.snap_every))
+                             if getattr(p_k, "snap_every", 0) > 0 else (0.1, 0.5, 1.0))
+
+            sim = SpatialGameFast(
+                p_k,
+                out_dir=out_dir,
+                log_every=log_every_eff,
+                snapshots=snapshots_eff,
+                save_plots=True
+            )
+        else:
+            # 其他 replica 不写任何文件
+            sim = SpatialGameFast(p_k)
+
+        out = sim.run()
+        results.append(out)
+
+        try:
+            q.put(1)
+        except Exception:
+            pass
+
+    def agg(key):
+        arr = np.array([r[key] for r in results], dtype=float)
+        return float(arr.mean()), float(arr.std())
+
+    meanC, stdC = agg("frac_C")
+    meanD, stdD = agg("frac_D")
+    meanL, stdL = agg("frac_L")
+    meanAvg, stdAvg = agg("avg_res")
+    meanSum, stdSum = agg("sum_res")
+    meanG, stdG = agg("gini")
+    meanCum, stdCum = agg("cum_sigma")
+    meanNet, stdNet = agg("net_output")
+    meanOut, stdOut = agg("cum_output")
+    meanHatS, stdHatS = agg("cum_sigma_hat")
+    meanHatN, stdHatN = agg("net_output_hat")
+    meanHatO, stdHatO = agg("cum_output_hat")
+
+    outrow = {**cfg,
+              "frac_C_mean": meanC, "frac_C_std": stdC,
+              "frac_D_mean": meanD, "frac_D_std": stdD,
+              "frac_L_mean": meanL, "frac_L_std": stdL,
+              "avg_res_mean": meanAvg, "avg_res_std": stdAvg,
+              "sum_res_mean": meanSum, "sum_res_std": stdSum,
+              "gini_mean": meanG, "gini_std": stdG,
+              "cum_sigma_mean": meanCum, "cum_sigma_std": stdCum,
+              "net_output_mean": meanNet, "net_output_std": stdNet,
+              "cum_output_mean": meanOut, "cum_output_std": stdOut,
+              "cum_sigma_hat_mean": meanHatS, "cum_sigma_hat_std": stdHatS,
+              "net_output_hat_mean": meanHatN, "net_output_hat_std": stdHatN,
+              "cum_output_hat_mean": meanHatO, "cum_output_hat_std": stdHatO,
+              }
+    return outrow
+
+def main():
+    combos = list(iter_param_combos(GRID))
+    n_configs = len(combos)
+    print(f"Total configs: {n_configs} × replicas {REPLICAS}")
+    print("cpu_count=", os.cpu_count())
+    print("N_PROCS=", N_PROCS)
+
+    manager = mp.Manager()
+    prog_q = manager.Queue()
+    total_ticks = n_configs * REPLICAS
+
+    th = threading.Thread(target=_progress_consumer_thread,
+                          args=(prog_q, total_ticks, "Sweep (config×replica)"),
+                          daemon=True)
+    th.start()
+
+    # --- CHANGED --- 统一的大文件夹名（包含时间戳）
+    run_root = os.path.join("sweep_out", RUN_TS)
+    os.makedirs(run_root, exist_ok=True)
+
+    # --- CHANGED --- 把 run_root 作为参数传进每个任务
+    tasks = [(cfg, BASE, REPLICAS, BASE.seed, prog_q, run_root) for cfg in combos]
+
+    t0 = time.time()
+    rows = []
+    with mp.get_context("spawn").Pool(processes=N_PROCS,
+                                      initializer=_worker_init_reduce_blas_threads,
+                                      maxtasksperchild=1) as pool:
+        it = pool.imap_unordered(run_one_config, tasks, chunksize=1)
+        for row in it:
+            rows.append(row)
+    dt = time.time() - t0
+    th.join(timeout=1.0)
+
+    # 保存 CSV（放在 run_root 下）
+    param_keys = sorted(GRID.keys())
+    metric_keys = [
+        "frac_C_mean", "frac_D_mean", "frac_L_mean",
+        "avg_res_mean", "gini_mean",
+        "sum_res_mean",
+        "cum_sigma_mean",
+        "cum_output_mean",
+        "net_output_mean",
+        "cum_sigma_hat_mean",
+        "cum_output_hat_mean",
+        "net_output_hat_mean",
+    ]
+    fieldnames = param_keys + metric_keys
+
+    rows_sorted = sorted(rows, key=lambda d: tuple(d.get(k, 0.0) for k in param_keys))
+    grid_name = "-".join(param_keys)
+    csv_name = f"sweep_{grid_name}_T{BASE.T}_rep{REPLICAS}_{RUN_TS}.csv"
+    csv_path = os.path.join(run_root, csv_name)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        f.write("# GRID = " + repr(GRID) + "\n")
+        f.write("# BASE = " + repr(BASE) + "\n")
+        f.write(f"# REPLICAS = {REPLICAS}, T = {BASE.T}\n")
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows_sorted:
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
+
+    print(f"Done in {dt:.1f}s. Saved: {csv_path}")
+
+    # 简单汇总图（同一 run_root 下）
+    from collections import defaultdict
+    import matplotlib.pyplot as plt
+
+    bucket_gini = defaultdict(list)
+    bucket_net_hat = defaultdict(list)
+    for r in rows_sorted:
+        key = (bool(r.get("allow_forced_l_in_cd", False)), float(r.get("r", 0.0)))
+        if "gini_mean" in r:
+            bucket_gini[key].append(float(r["gini_mean"]))
+        if "net_output_hat_mean" in r:
+            bucket_net_hat[key].append(float(r["net_output_hat_mean"]))
+
+    def agg_dict(bucket):
+        out = {}
+        for (allow, rr), vals in bucket.items():
+            if len(vals):
+                out.setdefault(allow, {})[rr] = float(np.mean(vals))
+        for allow in out:
+            out[allow] = dict(sorted(out[allow].items(), key=lambda kv: kv[0]))
+        return out
+
+    gini_curves = agg_dict(bucket_gini)
+    net_hat_curves = agg_dict(bucket_net_hat)
+
+    def plot_curves(curves, ylabel, fname):
+        fig = plt.figure(figsize=(7.4,4.6), dpi=140); ax = plt.gca()
+        for allow, d in curves.items():
+            if not d: continue
+            xs = np.array(list(d.keys())); ys = np.array(list(d.values()))
+            label = "Allow L (forced✓)" if allow else "No L"
+            ax.plot(xs, ys, marker="o", linewidth=1.8, label=label)
+        ax.set_xlabel("r"); ax.set_ylabel(ylabel); ax.grid(True, alpha=0.3); ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(run_root, fname), bbox_inches="tight")
+        plt.close(fig)
+
+    plot_curves(gini_curves, "Gini (final)", "summary_gini_vs_r.png")
+    plot_curves(net_hat_curves, "Net output (per-capita per-round)", "summary_net_output_hat_vs_r.png")
+
+    print("Saved summary figures:",
+          os.path.join(run_root, "summary_gini_vs_r.png"), " & ",
+          os.path.join(run_root, "summary_net_output_hat_vs_r.png"))
+
+if __name__ == "__main__":
+    main()
+

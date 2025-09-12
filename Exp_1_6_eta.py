@@ -968,13 +968,13 @@ import multiprocessing as mp
 
 # ---- 1) 定义你想扫的参数网格（自行改动） ----
 GRID = {
-    "r":                    [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
+    "r":                    [round(x, 2) for x in np.linspace(1.0, 2.0, 51)],#[1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
     "allow_forced_l_in_cd": [True, False],
     #"pi0":                  [ 5,  10],
     #"kappa":                [ 1 ],
     #"update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
     #"learn_signal":         [ 'cumulative' ,'round'],   #"round", "cumulative", "per_strategy", "hybrid"
-    "eta":                  [0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
+    "eta":                  [0.0]#[0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
     #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
     # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
 }

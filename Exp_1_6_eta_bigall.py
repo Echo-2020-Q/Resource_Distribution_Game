@@ -67,13 +67,6 @@ class Params:
     scale_low: float = 0.0        # min–max 目标下界
     scale_high: float = 1.0       # min–max 目标上界
     scale_eps: float = 1e-9       # 极小跨度保护，防止除零
-    burn_in_frac: float = 0.5  # ★ 新增：用于计算各类“*_mean”时跳过前 burn_in_frac*T 的回合
-    # 输出/采样控制（可选；让 BASE 里也能统一配置）
-    out_dir: Optional[str] = None  # None=不写；"AUTO"=runs/<ts>；也可自定义字符串
-    log_every: int = -1  # -1≈自动200点；0=不写；>=1=指定步长
-    snap_every: int = 0  # 0=用比例点(0.1/0.5/1.0)；>0=每 N 回合存一张快照图
-
-
 # ===== 工具 =====
 
 
@@ -128,34 +121,7 @@ def rolled(arr: np.ndarray):
     right = np.roll(arr, 1, axis=1)
     return up, down, left, right
 
-# ★★★ 新增：四邻边类型统计 + D 周长（用于 CSV / 归因） ★★★
-def edge_stats_four_neigh(S: np.ndarray):
-    """
-    四邻+环面。返回：
-      counts: CC,CD,DD,CL,DL,LL,D_perim,E
-      ratios: *_ratio（对 E 归一化）
-    """
-    right = np.roll(S, -1, axis=1)
-    down  = np.roll(S, -1, axis=0)
-    a1, b1 = S, right
-    a2, b2 = S, down
 
-    def cnt_pair(a,b,x,y):
-        return ((a==x)&(b==y)).sum() + ((a==y)&(b==x)).sum()
-
-    E = S.size * 2
-
-    CC = ((a1==C)&(b1==C)).sum() + ((a2==C)&(b2==C)).sum()
-    DD = ((a1==D)&(b1==D)).sum() + ((a2==D)&(b2==D)).sum()
-    LL = ((a1==L)&(b1==L)).sum() + ((a2==L)&(b2==L)).sum()
-    CD = cnt_pair(a1,b1,C,D) + cnt_pair(a2,b2,C,D)
-    CL = cnt_pair(a1,b1,C,L) + cnt_pair(a2,b2,C,L)
-    DL = cnt_pair(a1,b1,D,L) + cnt_pair(a2,b2,D,L)
-
-    D_perim = CD + DL
-    counts = dict(CC=CC, CD=CD, DD=DD, CL=CL, DL=DL, LL=LL, D_perim=D_perim, E=E)
-    ratios = {k+"_ratio": counts[k]/E for k in ["CC","CD","DD","CL","DL","LL","D_perim"]}
-    return {**counts, **ratios}
 # ====== 主仿真（向量化 + 无绘图版）======
 class SpatialGameFast:
     def __init__(
@@ -201,32 +167,9 @@ class SpatialGameFast:
         self.snap_steps = sorted(snaps)
 
         # 时间序列缓存
-        self._ts = []  # 每项：(t, frac_C, frac_D, frac_L, avg_res, gini, cum_sigma_hat, cum_output_hat, per_sigma, per_output, per_net, cum_net_hat)
+        self._ts = []  # 每项：(t, frac_C, frac_D, frac_L, avg_res, gini)
         if self.out_dir:
             os.makedirs(self.out_dir, exist_ok=True)
-
-        # ★新增：snapshot.csv writer（按 log_every 写，避免文件过大）
-        self._snapshot_writer = None
-        self._snapshot_file = None
-        if self.out_dir and self.log_every > 0:
-            snap_path = os.path.join(self.out_dir, "snapshot.csv")
-            self._snapshot_file = open(snap_path, "w", newline="", encoding="utf-8")
-            fields = [
-                "t","frac_C","frac_D","frac_L","avg_res","gini",
-                "per_sigma","per_output","per_net","cum_net_hat",
-                "edges_CC","edges_CD","edges_DD","edges_CL","edges_DL","edges_LL","edges_total",
-                "edges_CC_ratio","edges_CD_ratio","edges_DD_ratio","edges_CL_ratio","edges_DL_ratio","edges_LL_ratio",
-                "D_perimeter","D_perimeter_ratio"
-            ]
-            self._snapshot_writer = csv.DictWriter(self._snapshot_file, fieldnames=fields)
-            self._snapshot_writer.writeheader()
-
-        # ★新增：后半程均值累加器（burn-in=0.5T）
-        self.E_per_round = 2 * (self.L ** 2)
-        self.edge_acc = {k: 0 for k in ["CC","CD","DD","CL","DL","LL","D_perim"]}
-        self.edge_samples = 0
-        # 原：self.burn_in = int(0.5 * self.p.T)
-        self.burn_in = int(max(0.0, min(1.0, getattr(self.p, "burn_in_frac", 0.5))) * self.p.T)  # ★
 
     # === 新增：把关键参数拼成短标签，用于标题/文件名 ===
     def _short_name(self, base_name: str) -> str:
@@ -324,59 +267,30 @@ class SpatialGameFast:
         frac_L = float(np.mean(self.strat == L)) if self.include_loner else 0.0
         return frac_C, frac_D, frac_L
 
-    # ★修改：新增 es（边统计）参数与 snapshot.csv 写入、均值累加
-    def _record_trend(self, t, per_sigma_t=0.0, per_output_t=0.0, per_net_t=0.0, es: dict = None):
-        frac_C, frac_D, frac_L = self._fractions()
-        avg_res = float(np.mean(self.res))
-        gini = gini_allow_negative(self.res)
-
-        N = self.L * self.L
-        if t > 0:
-            cum_sigma_hat_t = (self.cum_sigma / (N * t)) if self.include_loner else 0.0
-            cum_output_hat_t = self.cum_output / (N * t)
-            cum_net_hat_t = (self.cum_output - self.cum_sigma) / (N * t)
-        else:
-            cum_sigma_hat_t = 0.0
-            cum_output_hat_t = 0.0
-            cum_net_hat_t = 0.0
-
-        # 原时间序列缓存
+    def _record_trend(self, t, per_sigma_t=0.0, per_output_t=0.0, per_net_t=0.0):
         if self.log_every > 0 and (t == 0 or t % self.log_every == 0 or t == self.p.T):
+            frac_C, frac_D, frac_L = self._fractions()
+            avg_res = float(np.mean(self.res))
+            gini = gini_allow_negative(self.res)
+
+            N = self.L * self.L
+            if t > 0:
+                cum_sigma_hat_t = (self.cum_sigma / (N * t)) if self.include_loner else 0.0
+                cum_output_hat_t = self.cum_output / (N * t)
+                cum_net_hat_t = (self.cum_output - self.cum_sigma) / (N * t)
+
+            else:
+                cum_sigma_hat_t = 0.0
+                cum_output_hat_t = 0.0
+                cum_net_hat_t = 0.0
+
             self._ts.append((
                 t, frac_C, frac_D, frac_L,
                 avg_res, gini,
-                cum_sigma_hat_t, cum_output_hat_t,  # 归一化累计
-                per_sigma_t, per_output_t, per_net_t,  # 每回合
-                cum_net_hat_t  # 累计净产出（每人每回合）
+                cum_sigma_hat_t, cum_output_hat_t,  # 归一化累计（你原来就有）
+                per_sigma_t, per_output_t, per_net_t,  # ★每回合数据
+                cum_net_hat_t  # ★累计净产出（每人每回合）
             ))
-
-        # snapshot.csv（含边统计）
-        if self._snapshot_writer and (t == 0 or t % self.log_every == 0 or t == self.p.T):
-            if es is None:
-                es = edge_stats_four_neigh(self.strat)
-            row = {
-                "t": t,
-                "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
-                "avg_res": avg_res, "gini": gini,
-                "per_sigma": per_sigma_t, "per_output": per_output_t, "per_net": per_net_t,
-                "cum_net_hat": cum_net_hat_t,
-                "edges_CC": es["CC"], "edges_CD": es["CD"], "edges_DD": es["DD"],
-                "edges_CL": es["CL"], "edges_DL": es["DL"], "edges_LL": es["LL"],
-                "edges_total": es["E"],
-                "edges_CC_ratio": es["CC_ratio"], "edges_CD_ratio": es["CD_ratio"],
-                "edges_DD_ratio": es["DD_ratio"], "edges_CL_ratio": es["CL_ratio"],
-                "edges_DL_ratio": es["DL_ratio"], "edges_LL_ratio": es["LL_ratio"],
-                "D_perimeter": es["D_perim"], "D_perimeter_ratio": es["D_perim_ratio"],
-            }
-            self._snapshot_writer.writerow(row)
-
-        # 后半程均值累加
-        if es is None:
-            es = edge_stats_four_neigh(self.strat)
-        if t >= self.burn_in:
-            for k in ["CC","CD","DD","CL","DL","LL","D_perim"]:
-                self.edge_acc[k] += es[k]
-            self.edge_samples += 1
 
     def _plot_strategy_map(self, t, fname):
         # 颜色：C=蓝，D=红，L=灰（如果没启 L，L 不会出现）
@@ -807,22 +721,14 @@ class SpatialGameFast:
         self._safe_savefig(fig, "timeseries_cum_net_hat.png");
         plt.close(fig)
 
-    # ★新增：把边均值整理成汇总字典
-    def _edge_means_for_summary(self) -> Dict[str, float]:
-        n = max(1, self.edge_samples)
-        E = self.E_per_round
-        mean_ratio = {f"edges_{k}_mean_ratio": self.edge_acc[k] / (E * n)
-                      for k in ["CC","CD","DD","CL","DL","LL"]}
-        return {
-            **mean_ratio,
-            "D_perimeter_mean": self.edge_acc["D_perim"] / n,
-            "D_perimeter_mean_ratio": self.edge_acc["D_perim"] / (E * n),
-        }
 
     def run(self) -> Dict[str, float]:
+        # 只做极简统计：起始与最终
+        # 初始
+        # （可按需保留）init_frac_C = float(np.mean(self.strat == C))
+        # 迭代
         # —— 新增：t=0 的初始点 ——
-        es0 = edge_stats_four_neigh(self.strat)  # ★新增
-        self._record_trend(0, 0.0, 0.0, 0.0, es=es0)
+        self._record_trend(0, 0.0, 0.0, 0.0)
         self._maybe_snapshot_plots(0)
 
         for t in range(1, self.p.T + 1):
@@ -874,11 +780,11 @@ class SpatialGameFast:
                                  "'fermi','best_rational','best_imitation',"
                                  "'best_imitation_logit','best_rational_logit'")
 
-            # —— 记录与快照（含边统计） ——
-            es_t = edge_stats_four_neigh(self.strat)  # ★新增
-            self._record_trend(t, per_sigma_t, per_output_t, per_net_t, es=es_t)
+            # —— 记录与快照 ——
+            self._record_trend(t, per_sigma_t, per_output_t, per_net_t)
             self._maybe_snapshot_plots(t)
 
+        # 结束统计（保持你原来的）
         # 结束统计
         frac_C = float(np.mean(self.strat == C))
         frac_D = float(np.mean(self.strat == D))
@@ -898,22 +804,12 @@ class SpatialGameFast:
         cum_output_hat = self.cum_output / (N * T)
         # ==================================
 
-        # —— 关闭 snapshot.csv 文件句柄（若有）——
-        if self._snapshot_file is not None:
-            try:
-                self._snapshot_file.close()
-            except Exception:
-                pass
-
         # —— 新增：保存时间序列 ——
         self._dump_trend_csv()
         # —— 新增：绘制 CDL 曲线图 ——
         self._dump_trend_png()
 
         self._plot_extra_time_series()
-
-        # ★新增：将边类型/周长的“后半程均值”汇总进返回值
-        edge_summary = self._edge_means_for_summary()
 
         return {
             "frac_C": frac_C, "frac_D": frac_D, "frac_L": frac_L,
@@ -924,7 +820,6 @@ class SpatialGameFast:
             "cum_sigma_hat": float(cum_sigma / (N * T)),
             "cum_output_hat": float(cum_output / (N * T)),
             "net_output_hat": float(net_output / (N * T)),
-            **edge_summary,  # ★新增：edges_*_mean_ratio, D_perimeter_mean(_ratio)
         }
 
 
@@ -962,15 +857,6 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allow_forced_l", action="store_true", help="仅CD起始时也允许破产转L")
     parser.add_argument("--runs", type=int, default=1, help="并行独立重复次数（不同随机种子）")
-    parser.add_argument("--burn", type=float, default=0.5,
-                        help="burn-in fraction for summary means (0~1). 0=不用烧入，1=只看最后一个回合")
-    parser.add_argument("--out", type=str, default="AUTO",
-                        help="输出目录。AUTO=自动 runs/<时间戳>；空串\"\"或none=不写CSV/图；其它=自定义目录")
-    parser.add_argument("--log-every", type=int, default=-1,
-                        help="每多少回合写一行 snapshot/trend。-1=自动约200点；0=不写；>=1=指定步长")
-    parser.add_argument("--snap-every", type=int, default=0,
-                        help="每多少回合保存一次快照图（0=用比例点 0.1/0.5/1.0）")
-
     args = parser.parse_args()
 
     p = Params(
@@ -984,32 +870,7 @@ def main():
         seed=args.seed,
         allow_forced_l_in_cd=args.allow_forced_l,
         update_rule=args.update,   # ← 新增
-        burn_in_frac=args.burn,
     )
-    # === 输出目录 ===
-    if args.out is None:
-        out_dir = None
-    else:
-        out_str = str(args.out).strip()
-        if out_str == "" or out_str.lower() == "none":
-            out_dir = None
-        elif out_str == "AUTO":
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            out_dir = os.path.join("runs", ts)
-        else:
-            out_dir = out_str
-
-    # === 采样频率 ===
-    if args.log_every < 0:
-        log_every = (max(1, p.T // 200) if out_dir else 0)  # AUTO≈200个点
-    else:
-        log_every = int(args.log_every)
-
-    # === 快照帧 ===
-    if args.snap_every and args.snap_every > 0:
-        snapshots = list(range(args.snap_every, p.T + 1, args.snap_every))
-    else:
-        snapshots = (0.1, 0.5, 1.0)
 
     # 根据“单次 or 并行”设置 BLAS 线程
     if args.runs == 1:
@@ -1019,33 +880,10 @@ def main():
         # 并行：每个进程限制为 1 线程（真正的扩展在进程数上）
         set_blas_threads(1)
 
+
     if args.runs == 1:
-         # —— 计算“生效”的输出设置（只用 CLI 解析得到的本地变量，避免依赖 BASE） ——
-        out_dir_eff = out_dir
-        log_every_eff = (log_every if log_every is not None else -1)
-
-        if int(log_every_eff) < 0:
-            log_every_eff = (max(1, p.T // 200) if out_dir_eff else 0)
-        snapshots_eff = snapshots
-
-        # 解析 out_dir（支持 "AUTO"/None/自定义路径）
-        if out_dir_eff and str(out_dir_eff).lower() != "none":
-            out_dir_real = (os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
-                            if str(out_dir_eff).upper() == "AUTO" else str(out_dir_eff))
-            os.makedirs(out_dir_real, exist_ok=True)
-        else:
-            out_dir_real = None
-
-        sim = SpatialGameFast(
-            p,
-            out_dir=out_dir_real,
-            log_every=int(log_every_eff),
-            snapshots=snapshots_eff,
-            save_plots=bool(out_dir_real)
-        )
-
         t0 = time.time()
-        out = sim.run()
+        out = run_once(p)
         dt = time.time() - t0
         print(f"[Single run done in {dt:.2f}s]")
         print(
@@ -1054,202 +892,123 @@ def main():
             f"avg_res={out['avg_res']:.3f}  sum_res={out['sum_res']:.3f}  gini={out['gini']:.3f}  "
             f"cum_sigma={out['cum_sigma']:.3f}  cum_output={out['cum_output']:.3f}  net_output={out['net_output']:.3f}"
         )
-        if out_dir_real:
-            print(f"Saved to: {out_dir_real}")
-
-
-
-
 
 
     else:
-
-        # ===== 并行：只让 rep0 写 CSV/图，其余副本只算统计 =====
-
-        N_PROCS = min(args.runs, os.cpu_count() or 1)
-
-        results = []
-
-        t0 = time.time()
-
-        # —— 计算“生效”的输出/采样设置（与单次分支一致；不依赖 BASE） ——
-        out_dir_eff = out_dir
-        log_every_eff = (log_every if log_every is not None else -1)
-
-        if int(log_every_eff) < 0:
-            log_every_eff = (max(1, p.T // 200) if out_dir_eff else 0)
-        snapshots_eff = snapshots
-
-        # —— rep0：主进程内运行并写输出 ——
-
-        if out_dir_eff and str(out_dir_eff).lower() != "none":
-
-            out_dir_root = (os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
-
-                            if str(out_dir_eff).upper() == "AUTO" else str(out_dir_eff))
-
-            rep0_dir = os.path.join(out_dir_root, "rep0")
-
-            os.makedirs(rep0_dir, exist_ok=True)
-
-        else:
-
-            out_dir_root = None
-
-            rep0_dir = None
-
-        p0 = Params(**{**p.__dict__, "seed": (None if p.seed is None else p.seed)})
-
-        sim0 = SpatialGameFast(
-
-            p0,
-
-            out_dir=rep0_dir,
-
-            log_every=int(log_every_eff if rep0_dir else 0),
-
-            snapshots=snapshots_eff,
-
-            save_plots=bool(rep0_dir)
-
-        )
-
-        out0 = sim0.run()
-
-        results.append(out0)
-
-        # —— 其余副本：进程池计算，不写文件 ——
-
+        # 多进程跑多次独立重复（不同随机种子），聚合统计
         jobs = []
-
-        for k in range(1, args.runs):
+        for k in range(args.runs):
             pk = Params(**{**p.__dict__, "seed": (None if p.seed is None else p.seed + k)})
-
             jobs.append(pk)
-
-        if jobs:
-
-            with mp.get_context("spawn").Pool(
-
-                    processes=min(len(jobs), N_PROCS),
-
-                    initializer=_worker_init_reduce_blas_threads,
-
-                    maxtasksperchild=1
-
-            ) as pool:
-
-                for out in pool.imap_unordered(run_once, jobs, chunksize=1):
-                    results.append(out)
-
+        N_PROCS = min(args.runs, os.cpu_count() or 1)
+        t0 = time.time()
+        results = []
+        with mp.get_context("spawn").Pool(
+                processes=N_PROCS,
+                initializer=_worker_init_reduce_blas_threads,  # 每个进程把BLAS线程钉到1
+                maxtasksperchild=1  # 防止长期运行内存上涨
+        ) as pool:
+            for out in pool.imap_unordered(run_once, jobs, chunksize=1):
+                results.append(out)
         dt = time.time() - t0
 
-        # ===== 聚合并打印 =====
+        # ===== 聚合 =====
 
         arrC = np.array([r["frac_C"] for r in results], dtype=float)
-
         arrD = np.array([r["frac_D"] for r in results], dtype=float)
-
         arrL = np.array([r["frac_L"] for r in results], dtype=float)
-
         arrAvg = np.array([r["avg_res"] for r in results], dtype=float)
-
         arrSum = np.array([r["sum_res"] for r in results], dtype=float)
-
         arrG = np.array([r["gini"] for r in results], dtype=float)
-
         arrCum = np.array([r["cum_sigma"] for r in results], dtype=float)
-
         arrNet = np.array([r["net_output"] for r in results], dtype=float)
-
         print(f"[{args.runs} runs done in {dt:.2f}s] mean±std:")
-
         print(f"C={arrC.mean():.3f}±{arrC.std():.3f}  D={arrD.mean():.3f}±{arrD.std():.3f}  "
-
               f"L={arrL.mean():.3f}±{arrL.std():.3f}")
-
         print(f"avg_res={arrAvg.mean():.3f}±{arrAvg.std():.3f}  "
-
               f"sum_res={arrSum.mean():.3f}±{arrSum.std():.3f}  "
-
               f"gini={arrG.mean():.3f}±{arrG.std():.3f}  "
-
               f"cum_sigma={arrCum.mean():.3f}±{arrCum.std():.3f}  "
-
               f"net_output={arrNet.mean():.3f}±{arrNet.std():.3f}")
-
-        if rep0_dir:
-            print(f"[rep0 outputs] saved to: {rep0_dir}")
 
 
 # if __name__ == "__main__":
 #     main()
 #
-# （下略：保留你原先的示例 main 与 sweep 注释）
+# if __name__ == "__main__":
+#     p_cd = Params(
+#         Lsize=60, T=10000,
+#         fc=0.5, fd=0.5, fL=None,  # fL=None => 仅 CD 起始
+#         pi0=5,  # 初始资源
+#         r=1.8, sigma=0.25,  # r: 背叛诱惑系数, sigma: Loner低保
+#         kappa=1,  # 费米学习因子
+#         learn_signal="cumulative",  # 'per_strategy' / 'round' / 'cumulative'
+#         seed=0,
+#         allow_forced_l_in_cd=True  # 资源耗尽者是否变为 L
+#     )
+#
+#     sim_cd = SpatialGameFast(p_cd)
+#     result = sim_cd.run()
+#
+#     print("[CD-start] final fractions:",
+#           f"C={result['frac_C']:.3f}",
+#           f"D={result['frac_D']:.3f}",
+#           f"L={result['frac_L']:.3f}",
+#           f"avg_res={result['avg_res']:.3f}",
+#           f"sum_res={result['sum_res']:.3f}",
+#           f"gini={result['gini']:.3f}")
+
+
 # sweep_parallel.py
 # -*- coding: utf-8 -*-
 import os, csv, time, itertools
 import numpy as np
 import multiprocessing as mp
+import os, csv, time, itertools
+import numpy as np
+import multiprocessing as mp
+import threading
+from tqdm.auto import tqdm
 
+# === 新增：本次运行的时间戳 & 大目录 ===
+RUN_TS = time.strftime("%Y%m%d-%H%M%S")
+BIG_ROOT = os.path.join("sweep_out", f"big_sweep_{RUN_TS}")
+os.makedirs(BIG_ROOT, exist_ok=True)
 
 # ---- 1) 定义你想扫的参数网格（自行改动） ----
 GRID = {
     #"r":                    [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
-    "r":   [round(x, 2) for x in np.linspace(1.0, 2.0, 51)],
+    "r":                    [round(x, 2) for x in np.linspace(1.0, 2.0, 51)],
     "allow_forced_l_in_cd": [True, False],
     #"pi0":                  [ 5,  10],
     #"kappa":                [ 1 ],
     #"update_rule":          ['best_imitation_logit'] ,#"fermi","best_rational","best_imitation","best_imitation_logit","best_rational_logit"
     #"learn_signal":         [ 'cumulative' ,'round'],   #"round", "cumulative", "per_strategy", "hybrid"
     #"eta":                  [0, 0.2, 0.4, 0.6, 0.8, 1]          # η累计收益注重系数
-    "eta": [round(x, 2) for x in np.linspace(0.0, 1.0, 51)],
+    "eta":                   [round(x, 2) for x in np.linspace(1.0, 2.0, 51)]  #[round(x, 2) for x in np.linspace(0.0, 1.0, 51)],
     #"sigma":                [0.25,0.26,0.27,0.28,0.29,0.30]
     # 也可加入 "sigma": [0.2, 0.3], "allow_forced_l_in_cd": [False, True], ...
 }
 # 固定不变的公共参数
-# 固定不变的公共参数（可在此统一调参）
 BASE = Params(
-    # --- 结构/时长 ---
-    Lsize=50,            # 格子边长 L，环境大小 L x L（周期边界）
-    T=50000,             # 演化总回合数
-
-    # --- 初始策略配比（仅CD时用 fc, fd；CDL 用 fc, fd, fL）---
-    fc=0.5,
-    fd=0.5,
-    fL=None,             # None=仅CD；给个数比如0.1时=CDL
-
-    # --- 博弈参数 ---
-    r=1.6,               # 背叛诱惑指数
-    pi0=10.0,            # 初始资源 π0
-    sigma=0.25,          # Loner 单边互动收益（每个邻边都拿 σ）
-    alpha=1.0,           # 每回合固定消耗
-    gamma=70.0,          # 资源阈值
-    beta=0.1,            # 超阈后的比例消耗
-    Min_Res=-10000.0,    # 资源软下限（跌破则回退）
-
-    # --- 学习/更新规则 ---
-    kappa=1,                             # 费米/Logit 温度
-    learn_signal="hybrid",               # 'round' / 'cumulative' / 'per_strategy' / 'hybrid'
-    eta=0.5,                             # hybrid 混合权重： (1-η)*minmax(round) + η*minmax(cum)
-    update_rule="best_imitation_logit",  # 'fermi' / 'best_rational' / 'best_imitation' / 'best_imitation_logit' / 'best_rational_logit'
-    allow_forced_l_in_cd=False,          # 仅CD起始时是否允许破产→L
-    seed=0,                              # 随机种（sweep 副本会偏移）
-
-    # --- 归一化刻度（一般不用改）---
-    scale_low=0.0,
-    scale_high=1.0,
-    scale_eps=1e-9,
-
-    # --- 统计均值的烧入比例（只影响 run() 返回的 *mean*；不影响 snapshot.csv）---
-    burn_in_frac=0.5,    # 0=全程平均；1=只看最后一回合
-
-    # --- 输出/采样控制（新加，可被 sweep 读取）---
-    out_dir="AUTO",      # "AUTO"=runs/<时间戳>；None/""=不写；也可给自定义目录
-    log_every= 25,        # -1≈自动 ~200 个采样点；1=每回合；100=每100回合
-    snap_every=0         # 0=按比例点(0.1/0.5/1.0)；>0=每 N 回合存一张快照图
+    Lsize= 50,   # 格子边长 L，环境大小 L x L（周期边界）
+    T= 50000,     # 演化总回合数
+    fc= 0.5,       # 初始 C 比例（仅 CD 模式时用 fc, fd；CDL 模式时用 fc, fd, fL）
+    fd= 0.5,
+    fL= None,
+    r= 1.6,        #背叛诱惑指数
+    pi0= 10.0,    # 初始资源 π0（所有玩家相同）
+    sigma= 0.25, # Loner 的单边互动收益 σ（每个邻边都拿 σ）
+    alpha= 1.0,   # 每回合的固定损耗参数
+    gamma= 70.0,  #阈值
+    beta = 0.1,  # 超出阈值后每回合消费当前资源的比例0.1
+    Min_Res=-10000.0,   #最低的资源值
+    kappa=1,     # 费米学习规则 κ
+    learn_signal="hybrid",          # 'round' / 'cumulative' / 'per_strategy'
+    seed=0,  # 会在副本里偏移
+    allow_forced_l_in_cd = False,
+    update_rule = "best_imitation_logit"  # 可选: 'fermi' / 'best_rational' / 'best_imitation'/"best_imitation_logit","best_rational_logit"
 )
-
 
 # 每组参数跑多少个随机种子副本求均值
 REPLICAS = 50
@@ -1259,8 +1018,7 @@ REPLICAS = 50
 N_PROCS = min(REPLICAS, os.cpu_count() or 1)
 
 
-# === 新增：本次运行的时间戳（文件夹名用） ===
-RUN_TS = time.strftime("%Y%m%d-%H%M%S")   # 例如 "20250904-1130"
+
 # ---- 2) 生成参数组合 ----
 def iter_param_combos(grid):
     keys = list(grid.keys())
@@ -1280,7 +1038,7 @@ def run_one_config(args):
 
     # 构建图像输出目录：按参数拼路径，避免混淆
     grid_name = "_".join([f"{k}={cfg[k]}" for k in sorted(cfg.keys())])
-    run_root = os.path.join("sweep_out", RUN_TS)
+    run_root = BIG_ROOT
     os.makedirs(run_root, exist_ok=True)
     save_root = os.path.join(run_root, grid_name)
     os.makedirs(save_root, exist_ok=True)
@@ -1290,18 +1048,12 @@ def run_one_config(args):
 
         # 仅首个副本出图，避免文件过多
         if k == 0:
-              # rep0 的输出目录（之前缺少定义，导致 NameError）
             out_dir = os.path.join(save_root, "rep0")
-            os.makedirs(out_dir, exist_ok=True)
-            log_every_eff = (p_k.log_every if getattr(p_k, "log_every", -1) >= 0 else max(1, p_k.T // 200))
-            snapshots_eff = (list(range(p_k.snap_every, p_k.T + 1, p_k.snap_every))
-                             if getattr(p_k, "snap_every", 0) > 0 else (0.001, 0.01, 0.1, 0.5, 1.0))
-
             sim = SpatialGameFast(
                 p_k,
                 out_dir=out_dir,
-                log_every=log_every_eff,
-                snapshots=snapshots_eff,
+                log_every=max(1, p_k.T // 200),  # 约 200 个点
+                snapshots=(0.001, 0.01, 0.1, 0.5, 1.0),
                 save_plots=True
             )
         else:
@@ -1361,8 +1113,6 @@ def main():
     combos = list(iter_param_combos(GRID))
     n_configs = len(combos)
     print(f"Total configs: {n_configs} × replicas {REPLICAS}")
-    print("cpu_count=", os.cpu_count())
-    print("N_PROCS=", N_PROCS)
 
     # ——— 心跳队列：子进程 put(1)，主进度条 +1
     manager = mp.Manager()
@@ -1419,7 +1169,7 @@ def main():
     grid_name = "-".join(param_keys)
     csv_name = f"sweep_{grid_name}_T{BASE.T}_rep{REPLICAS}_{RUN_TS}.csv"
 
-    run_root = os.path.join("sweep_out", RUN_TS)
+    run_root = BIG_ROOT
     os.makedirs(run_root, exist_ok=True)
     csv_path = os.path.join(run_root, csv_name)
 

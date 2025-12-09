@@ -1,0 +1,6 @@
+# GRID = {'r': [1.6], 'allow_forced_l_in_cd': [True, False], 'eta': [0.0]}
+# BASE = Params(Lsize=50, T=50000, fc=0.5, fd=0.5, fL=None, pi0=10.0, r=1.6, sigma=0.25, alpha=1.0, gamma=70.0, beta=0.1, Min_Res=-10000.0, kappa=1, learn_signal='hybrid', seed=0, allow_forced_l_in_cd=False, update_rule='best_imitation_logit', eta=0.5, scale_low=0.0, scale_high=1.0, scale_eps=1e-09, burn_in_frac=0.5, out_dir='AUTO', log_every=50000, snap_every=0, enable_ts=True, enable_trend_png=True, enable_timeseries_png=True, enable_snapshots=True, enable_snapshot_csv=True, enable_gini=True, edges_mode='always', capture_from=5000, capture_to=6000, capture_every=1, enable_capture_snapshots=True, enable_capture_csv=True)
+# REPLICAS = 1, T = 50000
+allow_forced_l_in_cd,eta,r,frac_C_mean,frac_D_mean,frac_L_mean,avg_res_mean,gini_mean,sum_res_mean,cum_sigma_mean,cum_output_mean,net_output_mean,cum_sigma_hat_mean,cum_output_hat_mean,net_output_hat_mean
+True,0.0,1.6,0.3308,0.5724,0.0968,69.88690942740901,0.10215595820210854,174717.2735685225,11400213.0,189352600.7999988,177952387.7999988,0.091201704,1.5148208063999904,1.4236191023999902
+False,0.0,1.6,0.2968,0.7032,0.0,56.08458675895154,0.25737899495931127,140211.46689737885,0.0,172060224.4000007,172060224.4000007,0.0,1.3764817952000055,1.3764817952000055

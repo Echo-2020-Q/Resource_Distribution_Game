@@ -23,18 +23,18 @@ matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 # ========= 配色 =========
-COLOR_POS = '#1f77b4'  # ΔL top
-COLOR_NEG = '#d62728'  # ΔL bottom
+COLOR_POS = '#264385'  # ΔL top
+COLOR_NEG = '#e23e35' # ΔL bottom
 COLOR_DIFF = '#2ca02c' # diff
 
 # ========= 参数 =========
 parser = argparse.ArgumentParser()
 parser.add_argument("--loner_csv", type=str,
     default=r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\Resource_Distribution_Game\Resource_Distribution_Game\sweep_out\b=1.6_有无Loner机制\capture_window_Loner.csv")
-parser.add_argument("--outdir", type=str, default="/mnt/data")
+parser.add_argument("--outdir", type=str, default=r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\Resource_Distribution_Game\Resource_Distribution_Game\sweep_out\20250912-191220扫描b")
 parser.add_argument("--h", type=int, default=30)
-parser.add_argument("--q_low", type=float, default=0.25)
-parser.add_argument("--q_high", type=float, default=0.75)
+parser.add_argument("--q_low", type=float, default=0.1)
+parser.add_argument("--q_high", type=float, default=0.9)
 parser.add_argument("--step2", type=int, default=10)
 args = parser.parse_args()
 
@@ -79,16 +79,17 @@ for step in [1, args.step2]:
     # ===== 图1: 两类事件曲线 =====
     plt.figure()
     x = np.arange(H+1)
-    plt.plot(x, m_pos, label="E[ΔC | ΔL ∈ top]", color=COLOR_POS, lw=2)
-    plt.plot(x, m_neg, label="E[ΔC | ΔL ∈ bottom]", color=COLOR_NEG, lw=2)
+    plt.plot(x, m_pos, label=r"$\Delta L_{Top}$", color=COLOR_POS, lw=1.5)
+    plt.plot(x, m_neg, label=r"$\Delta L_{Bottom}$", color=COLOR_NEG, lw=1.5)
     plt.axhline(0, color='gray', ls='--', alpha=0.5)
-    plt.xlabel("horizon h (raw steps)")
-    plt.ylabel("mean ΔC at t+h")
-    plt.title(f"Event-study (Loner, {tag}): ΔL shock vs future ΔC")
+    plt.xlabel("h(time steps)")
+    plt.ylabel("$\Delta f_C(t+h)$")
+    plt.title(f"")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(outroot / f"event_study_{tag}.png", dpi=150)
-    plt.close()
+    plt.savefig(outroot / f"event_study_{tag}.png", dpi=450)
+    plt.savefig(outroot / f"event_study_{tag}.svg", dpi=450)
+
 
     # ===== 图2: 差值曲线 =====
     plt.figure()
@@ -105,9 +106,11 @@ for step in [1, args.step2]:
     plt.title(f"Event-study diff (Loner, {tag}): top - bottom")
     plt.tight_layout()
     plt.savefig(outroot / f"event_study_diff_{tag}.png", dpi=150)
-    plt.close()
+
 
     print(f"[{tag}] pos={len(pos_idx)}, neg={len(neg_idx)}, best_h={np.nanargmax(m_diff)}, "
           f"max_diff={np.nanmax(m_diff):.4f}")
 
+plt.show()
 print(f"完成！图已保存到 {outroot}")
+

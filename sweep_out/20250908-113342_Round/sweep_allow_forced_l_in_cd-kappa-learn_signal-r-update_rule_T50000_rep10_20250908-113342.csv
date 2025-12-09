@@ -1,0 +1,9 @@
+,,,,,,,,,,,,,,, allow_forced_l_in_cd=False, update_rule='fermi'),,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,,
+allow_forced_l_in_cd,kappa,learn_signal,r,update_rule,frac_C_mean,frac_D_mean,frac_L_mean,avg_res_mean,gini_mean,cum_sigma_mean,net_sum_res_mean,,# GRID = {'r': [1.2,1.6, 1.8], 'allow_forced_l_in_cd': [True, False], 'kappa': [1], 'update_rule': ['best_imitation_logit'], 'learn_signal': ['round']},,,,,,,
+FALSE,1,round,1.2,best_imitation_logit,0.92156,0.07843999999999998,0,93.58886399999994,0.02012561560291528,0,233972.15999999986,,# BASE = Params(Lsize=50, T=50000, fc=0.5, fd=0.5, fL=None, pi0=10.0, r=1.6, sigma=0.25, alpha=1.0, gamma=70.0, beta=0.1, Min_Res=-10000.0, kappa=1, learn_signal='cumulative', seed=0
+TRUE,1,round,1.2,best_imitation_logit,0.9221200000000002,0.07787999999999999,0,93.60700799999995,0.019960478149646015,115.2,233902.3199999999,,# REPLICAS = 10, T = 50000,,,,,,,,,,,,,
+FALSE,1,round,1.6,best_imitation_logit,0,1,0,-9999.605568,1.636410910748113e-05,0,-24999013.92,,,,,,,,,,,,,,,,
+TRUE,1,round,1.6,best_imitation_logit,0.27852,0.43263999999999997,0.28884000000000004,64.70460050321576,0.14749388306963693,39379338,-39217576.5,,,,,,,,,,,,,,,,
+FALSE,1,round,1.8,best_imitation_logit,0,1,0,-9999.566093,1.690439844180808e-05,0,-24998915.23,,,,,,,,,,,,,,,,
+TRUE,1,round,1.8,best_imitation_logit,0.272,0.36140000000000005,0.36660000000000004,59.044675038643604,0.21634179349841828,47229064,-47081452.31,,,,,,,,,,,,,,,,

@@ -104,7 +104,7 @@ def main():
             )
 
     plt.xlabel("b")
-    plt.ylabel("$f_C(∞)$, $f_D(∞)$, $f_L(∞)$")
+    plt.ylabel("$f_C$, $f_D$, $f_L$")
     plt.title("")
     plt.legend()
     #plt.grid(True, alpha=0.3)
@@ -226,7 +226,7 @@ def main():
     plt.xlabel("b")
     plt.ylabel(r"$\bar{r}_{net}$")
     plt.title("")
-    plt.grid(True, alpha=0.3)
+    plt.grid(False)
     # -----手动标注collapse
     ax = plt.gca()
     ymin, ymax = ax.get_ylim()

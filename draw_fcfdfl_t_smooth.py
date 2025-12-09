@@ -120,7 +120,7 @@ plt.plot(centersL[mL], fdL_sm[mL], color="#e23e35",label="D", lw=1.5)
 plt.plot(centersL[mL], flL_sm[mL], color="#dbb428",label="L", lw=1.5)
 plt.xscale("log")
 xlabL = "t" if shiftL == 0 else f"t (shift {shiftL:.3g}, log scale)"
-plt.xlabel(xlabL); plt.ylabel("$f_C(∞)$, $f_D(∞)$, $f_L(∞)$")
+plt.xlabel(xlabL); plt.ylabel("$f_C$, $f_D$, $f_L$")
 plt.title("")
 #plt.grid(False, which="both", ls="--", alpha=0.35)
 plt.grid(False)
@@ -139,8 +139,8 @@ plt.plot(centersN[mN], fcN_sm[mN],  color="#264385",label="C", lw=1.5)
 plt.plot(centersN[mN], fdN_sm[mN], color="#e23e35",label="D", lw=1.5)
 plt.plot(centersN[mN], flN_sm[mN], color="#eae936",label="L", lw=1.5)
 plt.xscale("log")
-xlabN = "t (log scale)" if shiftN == 0 else f"t (shift {shiftN:.3g}, log scale)"
-plt.xlabel(xlabN); plt.ylabel("$f_C(∞)$, $f_D(∞)$, $f_L(∞)$")
+xlabN = "t" if shiftN == 0 else f"t (shift {shiftN:.3g}, log scale)"
+plt.xlabel(xlabN); plt.ylabel("$f_C$, $f_D$, $f_L$")
 plt.title("")
 #plt.grid(False, which="both", ls="--", alpha=0.35)
 plt.grid(False)
@@ -167,11 +167,11 @@ plt.plot(centersN[mN], fcN_sm[mN], color="#e23e35",label="C(without Loner)", lw=
 
 plt.xscale("log")
 plt.xlabel("t")
-plt.ylabel("$f_C(∞)$")
+plt.ylabel("$f_C$")
 plt.title("")  # 半角括号
 #plt.grid(True, which="both", ls="--", alpha=0.35)
 plt.grid(False)
-plt.legend
+plt.legend()
 plt.tight_layout()
 
 out3 = os.path.join(OUTDIR, "compare_fc_logt_smoothed.png")

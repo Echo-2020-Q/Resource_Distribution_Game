@@ -16,6 +16,19 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib
+import matplotlib.ticker as mticker
+matplotlib.rcParams['font.family'] = 'Times New Roman'
+matplotlib.rcParams['mathtext.fontset'] = 'stix'
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+matplotlib.rcParams['axes.labelsize'] = 24  # 坐标轴标签字体大小
+matplotlib.rcParams['xtick.labelsize'] = 24  # x轴刻度标签字体大小
+matplotlib.rcParams['ytick.labelsize'] = 24  # y轴刻度标签字体大小
+matplotlib.rcParams['legend.fontsize'] = 26  # 图例字体大小
+matplotlib.rcParams['figure.titlesize'] = 24  # 图形标题字体大小
+matplotlib.rcParams['font.weight'] = 'bold'  # 全局字体粗细
+matplotlib.rcParams['axes.labelweight'] = 'bold'  # 坐标轴标签字体粗细
 
 # ---------- 工具：对 fill_between 做健壮性封装 ----------
 def _safe_arrays(x, lo, hi):
@@ -34,7 +47,7 @@ def safe_fill_between(ax, x, lo, hi, **kw):
 # ========== 参数 ==========
 ap = argparse.ArgumentParser()
 ap.add_argument("--csv", type=str, default=r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\Resource_Distribution_Game\Resource_Distribution_Game\sweep_out\b=1.6_有无Loner机制\capture_window_"
-                                           r"Loner.csv", help="输入CSV，如 capture_window_NoLoner.csv")
+                                           r"NoLoner.csv", help="输入CSV，如 capture_window_NoLoner.csv")
 ap.add_argument("--outdir", type=str, default=r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\Resource_Distribution_Game\Resource_Distribution_Game\sweep_out\b=1.6_有无Loner机制\out_event_study_Loner", help="输出目录")
 ap.add_argument("--ds", type=int, default=20, help="降采样因子（原始步→显示步）")
 ap.add_argument("--q", type=float, default=0.8, help="差分分位数阈值（越小样本越多），如 0.75")
@@ -187,7 +200,7 @@ mode_tag = args.anchor_mode
 tag = f"{mode_tag}_q{int(Q*100):02d}_DS{DS}_pre{PRE}_post{POST}"
 
 # ========== 面板图 ==========
-fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=(11, 12), sharex=True)
 panel_data = [
     (axes[0], "C", C_mean, C_lo, C_hi, base_C),
     (axes[1], "D", D_mean, D_lo, D_hi, base_D),
@@ -199,23 +212,30 @@ for ax, name, mean, lo, hi, base in panel_data:
     safe_fill_between(ax, x, lo1, hi1, color=style.get("color", None),
                       alpha=fill_alpha_panel, linewidth=0)
     ax.plot(x[mask], np.asarray(mean).reshape(-1)[mask],
-            label=f"{name}(with Loner)", **style)
+            label=f"{name}(without Loner)", **style)
     ax.axvline(0, ls="--", lw=1)
     if base is not None:
         ax.axhline(base, ls=":", lw=1, color=style.get("color", "gray"), alpha=0.55)
-    ax.set_ylabel(f"$f_{name}$")
-    ax.legend(loc="best")
+    # ax.set_ylabel("The frequency of strategies")
+    if name == "D":
+        ax.legend(loc="lower left")
+    else:
+        ax.legend(loc="upper right")
     ax.grid(False)
 
+axes[1].set_ylabel("The frequency of strategies", labelpad=20)
+axes[1].yaxis.set_major_locator(mticker.MaxNLocator(nbins=6, prune='both'))
 axes[-1].set_xlabel("Time steps")
 #axes[0].set_title(f"Event study aligned on '{anchor_desc}' (3-panel with 95% CI)")
 axes[0].set_title("")
 plt.tight_layout()
 out_png = OUTDIR / f"event_study_panel_{tag}.png"
 out_svg = OUTDIR / f"event_study_panel_{tag}.svg"
+out_pdf = OUTDIR / f"event_study_panel_{tag}.pdf"
 plt.savefig(out_png, dpi=450)
 plt.savefig(out_svg)
-print(f"[panel] n={N_USED} -> {out_png}")
+plt.savefig(out_pdf)
+print(f"[panel] n={N_USED} -> {out_png}/{out_svg}/{out_pdf}")
 
 # ========== 三张单图 ==========
 figs = []
@@ -238,7 +258,7 @@ for name, mean, lo, hi in [("D", D_mean, D_lo, D_hi),
         ax.axhline(base, ls=":", lw=1, color=style.get("color", "gray"), alpha=0.55)
     ax.grid(False); ax.legend(loc="best")
     ax.set_xlabel("Time steps")
-    ax.set_ylabel(f"$f_{name}$")
+    ax.set_ylabel("The frequency of strategies")
     ax.set_title("")
     plt.tight_layout()
     out_png = OUTDIR / f"event_study_single_{tag}_{name}.png"

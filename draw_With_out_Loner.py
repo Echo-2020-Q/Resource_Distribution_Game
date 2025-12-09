@@ -15,7 +15,16 @@ matplotlib.rcParams['font.family'] = 'Times New Roman'
 matplotlib.rcParams['mathtext.fontset'] = 'stix'
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
 matplotlib.rcParams['axes.unicode_minus'] = False
-
+#matplotlib.rcParams['font.size'] = 14  # 全局字体大小
+matplotlib.rcParams['axes.labelsize'] = 26  # 坐标轴标签字体大小
+matplotlib.rcParams['xtick.labelsize'] = 24  # x轴刻度标签字体大小
+matplotlib.rcParams['ytick.labelsize'] = 24  # y轴刻度标签字体大小
+matplotlib.rcParams['legend.fontsize'] = 18  # 图例字体大小
+matplotlib.rcParams['figure.titlesize'] = 24  # 图形标题字体大小
+matplotlib.rcParams['font.weight'] = 'bold'  # 全局字体粗细
+matplotlib.rcParams['axes.labelweight'] = 'bold'  # 坐标轴标签字体粗细
+#===========================================================================================
+plt.close("all")  # 关闭之前的图
 def must_have(df, cols):
     miss = [c for c in cols if c not in df.columns]
     if miss:
@@ -41,10 +50,10 @@ def _smooth_plot(x, y, style, color, label):
         xs = np.linspace(x.min(), x.max(), 300)
         spline = make_interp_spline(x, y, k=k)
         ys = spline(xs)
-        plt.plot(xs, ys, linestyle=style, color=color, label=label)
+        plt.plot(xs, ys, linestyle=style, color=color, label=label, linewidth=3)
     else:
         # 没有 scipy 就用原始点直接画
-        plt.plot(x, y, linestyle=style, color=color, label=label)
+        plt.plot(x, y, linestyle=style, color=color, label=label, linewidth=3)
 
 def main():
     if not os.path.exists(CSV_PATH):
@@ -78,7 +87,7 @@ def main():
     )
 
     # ===== 图 1：C/D/L 比例 vs b（有/无 Loner）=====
-    plt.figure()
+    plt.figure(figsize=(10, 8))
 
     # (策略, 是否允许Loner) -> (颜色, 线型)
     style_map = {
@@ -104,22 +113,24 @@ def main():
             )
 
     plt.xlabel("b")
-    plt.ylabel("$f_C$, $f_D$, $f_L$")
+    plt.ylabel("The frequency of strategies")
     plt.title("")
     plt.legend()
     #plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    out1 = os.path.join(os.path.dirname(CSV_PATH) or ".", "fractions_vs_b.png")
-    out1_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "fractions_vs_b.svg")
+    out1 = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1a_fractions_vs_b.png")
+    out1_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1a_fractions_vs_b.svg")
+    out1_pdf = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1a_fractions_vs_b.pdf")
     plt.grid(False)
     plt.savefig(out1, dpi=600)
-    plt.savefig(out1_svg,dpi=600)
+    plt.savefig(out1_svg, dpi=600)
+    plt.savefig(out1_pdf)
 
     #plt.show()
-    plt.close()
+    # plt.close()
 
     # ===== 图 2：avg_res_mean vs b（有/无 Loner）=====
-    plt.figure()
+    plt.figure(figsize=(10, 8))
 
     # (是否允许Loner) -> (颜色, 线型, 阈值)
     style_map = {
@@ -136,7 +147,7 @@ def main():
         mask_valid = sub[avg_res_col] >= 20
         x_valid = sub.loc[mask_valid, b_col].to_numpy()
         y_valid = sub.loc[mask_valid, avg_res_col].to_numpy()
-        plt.plot(x_valid, y_valid, ls, color=color, label=label)
+        plt.plot(x_valid, y_valid, ls, color=color, label=label, linewidth=3)
 
         # 2) 标注 <= collapse_thresh 的崩溃点
         mask_collapse = sub[avg_res_col] <= collapse_thresh
@@ -161,10 +172,10 @@ def main():
     y_point = ymin + 0.05 * (ymax - ymin)  # 在底部稍微抬高一点，代替 y=0
 
     # 画一个蓝色圆点
-    plt.scatter(2.0, y_point, facecolors="none", edgecolors="#8a95a9", linewidths=1.5, zorder=5, label="$I_{collapse}$(with Loner)")
+    plt.scatter(2.0, y_point, s=200, facecolors="none", edgecolors="#8a95a9", linewidths=2.5, zorder=8, label="$I_{collapse}$(with Loner)")
 
     # 画一个青色方块点（另一种情况）
-    plt.scatter(2.0, y_point , color="#8a95a9", marker="x", zorder=5,
+    plt.scatter(2.0, y_point , s=200, color="#8a95a9", marker="x", linewidths=2.5, zorder=8,
                 label="$I_{collapse}$(without Loner)")
 
     # 如果还想在同一个 b=2.0 的位置再加一个 “without Loner” 标注
@@ -184,15 +195,17 @@ def main():
     plt.legend()
     #plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    out2 = os.path.join(os.path.dirname(CSV_PATH) or ".", "avg_res_mean_vs_b.png")
-    out2_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "avg_res_mean_vs_b.svg")
+    out2 = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1c_avg_res_mean_vs_b.png")
+    out2_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1c_avg_res_mean_vs_b.svg")
+    out2_pdf = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1c_avg_res_mean_vs_b.pdf")
     plt.savefig(out2, dpi=600)
     plt.savefig(out2_svg, dpi=600)
+    plt.savefig(out2_pdf)
     plt.grid(False)
-    plt.close()
+    # plt.close()
 
     # ===== 图 3：Net_output vs b（有/无 Loner；各自阈值）=====
-    plt.figure()
+    plt.figure(figsize=(10, 8))
 
     style_map = {
         True: {"color": "#e23e35", "ls": "-", "collapse_thresh": 1.0},  # with Loner
@@ -220,7 +233,7 @@ def main():
         y_draw = sub.loc[mask_draw, net_output_col].to_numpy()
 
         # 每条线单独一个 label
-        plt.plot(x_draw, y_draw, ls, color=color, label=label)
+        plt.plot(x_draw, y_draw, ls, color=color, label=label, linewidth=3)
 
     # 坐标和标题
     plt.xlabel("b")
@@ -233,25 +246,27 @@ def main():
     y_point = ymin + 0.05 * (ymax - ymin)  # 在底部稍微抬高一点，代替 y=0
 
     # 画一个蓝色圆点
-    plt.scatter(2.0, y_point, facecolors="none", edgecolors="#8a95a9", linewidths=1.5, zorder=5,
+    plt.scatter(2.0, y_point, s=200, facecolors="none", edgecolors="#8a95a9", linewidths=2.5, zorder=8,
                 label="$I_{collapse}$(with Loner)")
 
     # 画一个青色方块点（另一种情况）
-    plt.scatter(2.0, y_point, color="#8a95a9", marker="x", zorder=5,
+    plt.scatter(2.0, y_point, s=200, color="#8a95a9", marker="x", linewidths=2.5, zorder=8,
                 label="$I_{collapse}$(without Loner)")
 
 
     plt.legend()  # 加图例
     plt.tight_layout()
-    out3 = os.path.join(os.path.dirname(CSV_PATH) or ".", "net_output_vs_b.png")
-    out3_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "net_output_vs_b.svg")
+    out3 = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1b_net_output_vs_b.png")
+    out3_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1b_net_output_vs_b.svg")
+    out3_pdf = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1b_net_output_vs_b.pdf")
     plt.savefig(out3, dpi=600)
     plt.savefig(out3_svg, dpi=600)
+    plt.savefig(out3_pdf)
     plt.grid(False)
-    plt.close()
+    # plt.close()
 
     # ===== 图 4：Gini vs b（有/无 Loner；b=2.0 不画点，改为 I_collapse 标注）=====
-    plt.figure()
+    plt.figure(figsize=(10, 8))
 
     color_map = {
         True: "#dbb428",  # with Loner
@@ -289,14 +304,14 @@ def main():
 
     # 空心圆：with Loner
     plt.scatter(
-        B_COLLAPSE, y_point,
-        facecolors="none",edgecolors="#8a95a9", linewidths=1.5, zorder=5,
+        B_COLLAPSE, y_point, s=200,
+        facecolors="none",edgecolors="#8a95a9", linewidths=2.5, zorder=8,
         label=r"$I_{collapse}$ (with Loner)"
     )
     # 叉号：without Loner
     plt.scatter(
-        B_COLLAPSE, y_point,
-        color="#8a95a9", marker="x", zorder=5,
+        B_COLLAPSE, y_point, s=200,
+        color="#8a95a9", marker="x", linewidths=2.5, zorder=8,
         label=r"$I_{collapse}$ (without Loner)"
     )
 
@@ -306,10 +321,12 @@ def main():
     plt.legend()
     plt.grid(False)
     plt.tight_layout()
-    out4 = os.path.join(os.path.dirname(CSV_PATH) or ".", "gini_vs_b.png")
-    out4_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "gini_vs_b.svg")
+    out4 = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1d_gini_vs_b.png")
+    out4_svg = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1d_gini_vs_b.svg")
+    out4_pdf = os.path.join(os.path.dirname(CSV_PATH) or ".", "Fig1d_gini_vs_b.pdf")
     plt.savefig(out4, dpi=600)
     plt.savefig(out4_svg, dpi=600)
+    plt.savefig(out4_pdf)
     plt.show()
 
     print("✅ 4张图已生成：")

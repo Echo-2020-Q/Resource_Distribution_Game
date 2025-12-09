@@ -2,7 +2,21 @@
 import os
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
+matplotlib.rcParams['font.family'] = 'Times New Roman'
+matplotlib.rcParams['mathtext.fontset'] = 'stix'
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+matplotlib.rcParams['axes.labelsize'] = 24  # 坐标轴标签字体大小
+matplotlib.rcParams['xtick.labelsize'] = 24  # x轴刻度标签字体大小
+matplotlib.rcParams['ytick.labelsize'] = 24  # y轴刻度标签字体大小
+matplotlib.rcParams['legend.fontsize'] = 26  # 图例字体大小
+matplotlib.rcParams['figure.titlesize'] = 24  # 图形标题字体大小
+matplotlib.rcParams['font.weight'] = 'bold'  # 全局字体粗细
+matplotlib.rcParams['axes.labelweight'] = 'bold'  # 坐标轴标签字体粗细
+
+CBAR_LABEL_SIZE = 26  # 颜色条标签字体大小
 
 # ==== 1) 读取并筛选数据 ====
 CSV = r"D:\PyCharm_Community_Edition_2024_01_04\Py_Projects\Resource_Distribution_Game\Resource_Distribution_Game\sweep_out\扫描sigma\sweep_allow_forced_l_in_cd-eta-r-sigma_T50000_rep50_20250916-110326.csv"
@@ -22,8 +36,8 @@ ax = fig.add_subplot(111)
 Z = pvt.to_numpy()
 # 用 viridis 连续色图，并设置插值方式为 bilinear
 im = ax.imshow(Z, origin="lower", aspect="auto", cmap="YlGnBu", interpolation="bilinear")
-# 横坐标：固定在 1.0, 1.2, ..., 2.0
-xticks = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+# 横坐标：固定在 1.0, 1.1, ..., 2.0
+xticks = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
 ax.set_xticks([np.argmin(np.abs(pvt.columns - v)) for v in xticks])
 ax.set_xticklabels([f"{v:.1f}" for v in xticks])
 # 纵坐标：sigma 全部或抽样
@@ -32,22 +46,25 @@ ytick_idx = np.linspace(0, len(s_vals) - 1, num=min(12, len(s_vals)), dtype=int)
 ax.set_yticks(ytick_idx)
 ax.set_yticklabels([f"{s_vals[i]:.2f}" for i in ytick_idx])
 
-r_vals = pvt.columns.values
-s_vals = pvt.index.values
-xtick_idx = np.linspace(0, len(r_vals) - 1, num=min(10, len(r_vals)), dtype=int)
-ax.set_xticks(xtick_idx)
-ax.set_xticklabels([f"{r_vals[i]:.2f}" for i in xtick_idx], rotation=0, ha="right")
+# 添加等值线
+levels = [0.01, 0.35, 0.8]
 
-
+# 分别指定颜色：0.01(即0)为黑色，0.35和0.8为白色
+CS = ax.contour(Z, levels=levels, colors=['k', 'white', 'white'], linewidths=2)
+fmt = {0.01: '0', 0.35: '0.35', 0.8: '0.8'}
+labels = ax.clabel(CS, inline=True, fontsize=22, fmt=fmt)
+for l in labels:
+    l.set_rotation(0)
 
 ax.set_xlabel("b")
 ax.set_ylabel("$\sigma$")
 ax.set_title("")
 cbar = fig.colorbar(im, ax=ax)
-cbar.set_label("$f_c(∞)$")
+cbar.set_label("$f_c(∞)$", fontsize=CBAR_LABEL_SIZE)
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "heatmap_frac_C_mean.svg"), dpi=450)
 fig.savefig(os.path.join(OUTDIR, "heatmap_frac_C_mean.png"), dpi=450)
+fig.savefig(os.path.join(OUTDIR, "heatmap_frac_C_mean.pdf"), dpi=450)
 
 
 # ==== 4) avg_res_mean 的热力图 ====
@@ -59,8 +76,8 @@ ax = fig.add_subplot(111)
 Z = pvt.to_numpy()
 # 用 viridis 连续色图，并设置插值方式为 bilinear
 im = ax.imshow(Z, origin="lower", aspect="auto", cmap="YlOrBr", interpolation="bilinear")
-# 横坐标：固定在 1.0, 1.2, ..., 2.0
-xticks = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+# 横坐标：固定在 1.0, 1.1, ..., 2.0
+xticks = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
 ax.set_xticks([np.argmin(np.abs(pvt.columns - v)) for v in xticks])
 ax.set_xticklabels([f"{v:.1f}" for v in xticks])
 # 纵坐标：sigma 全部或抽样
@@ -72,10 +89,12 @@ ax.set_xlabel("b")
 ax.set_ylabel("$\sigma$")
 ax.set_title("")
 cbar = fig.colorbar(im, ax=ax)
-cbar.set_label(r"$\bar{R}_{res}$")
+cbar.set_label(r"$\bar{R}_{res}$", fontsize=CBAR_LABEL_SIZE)
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "heatmap_avg_res_mean.svg"), dpi=450)
 fig.savefig(os.path.join(OUTDIR, "heatmap_avg_res_mean.png"), dpi=450)
+fig.savefig(os.path.join(OUTDIR, "heatmap_avg_res_mean.pdf"), dpi=450)
+
 
 
 # ==== 5) net_output_hat_mean 的热力图 ====
@@ -87,8 +106,17 @@ ax = fig.add_subplot(111)
 Z = pvt.to_numpy()
 # 用 viridis 连续色图，并设置插值方式为 bilinear
 im = ax.imshow(Z, origin="lower", aspect="auto", cmap="YlGn", interpolation="bilinear")
-# 横坐标：固定在 1.0, 1.2, ..., 2.0
-xticks = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+
+# 添加 r_net 的等值线
+levels_rnet = [60, 75, 95]
+CS_rnet = ax.contour(Z, levels=levels_rnet, colors='white', linewidths=2)
+fmt_rnet = {60: '60', 75: '75', 95: '95'}
+labels_rnet = ax.clabel(CS_rnet, inline=True, fontsize=22, fmt=fmt_rnet)
+for l in labels_rnet:
+    l.set_rotation(0)
+
+# 横坐标：固定在 1.0, 1.1, ..., 2.0
+xticks = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
 ax.set_xticks([np.argmin(np.abs(pvt.columns - v)) for v in xticks])
 ax.set_xticklabels([f"{v:.1f}" for v in xticks])
 # 纵坐标：sigma 全部或抽样
@@ -101,11 +129,12 @@ ax.set_xlabel("b")
 ax.set_ylabel("$\sigma$")
 ax.set_title("")
 cbar = fig.colorbar(im, ax=ax)
-cbar.set_label(r"$\bar{r}_{net}$")
+cbar.set_label(r"$\bar{r}_{net}$", fontsize=CBAR_LABEL_SIZE)
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "heatmap_net_output_hat_mean.svg"), dpi=450)
 fig.savefig(os.path.join(OUTDIR, "heatmap_net_output_hat_mean.png"), dpi=450)
-plt.show()
+fig.savefig(os.path.join(OUTDIR, "heatmap_net_output_hat_mean.pdf"), dpi=450)
+
 # ==== 6) Gini 指数的热力图（sigma × r）====
 def _pivot_gini_mean(df_in):
     if "gini_mean" in df_in.columns:
@@ -150,12 +179,15 @@ im = ax.imshow(
 r_vals = pvt.columns.values
 s_vals = pvt.index.values
 
-# 让刻度数量在 8~10 以内，避免过密
-xtick_idx = np.linspace(0, len(r_vals) - 1, num=min(10, len(r_vals)), dtype=int)
+# 横坐标：固定在 1.0, 1.1, ..., 2.0
+xticks = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
+ax.set_xticks([np.argmin(np.abs(pvt.columns - v)) for v in xticks])
+ax.set_xticklabels([f"{v:.1f}" for v in xticks])
+
 ytick_idx = np.linspace(0, len(s_vals) - 1, num=min(12, len(s_vals)), dtype=int)
 
-ax.set_xticks(xtick_idx)
-ax.set_xticklabels([f"{r_vals[i]:.2f}" for i in xtick_idx])
+# ax.set_xticks(xtick_idx)
+# ax.set_xticklabels([f"{r_vals[i]:.2f}" for i in xtick_idx])
 ax.set_yticks(ytick_idx)
 ax.set_yticklabels([f"{s_vals[i]:.2f}" for i in ytick_idx])
 
@@ -164,12 +196,15 @@ ax.set_ylabel(r"$\sigma$")
 ax.set_title("")
 
 cbar = fig.colorbar(im, ax=ax)
-cbar.set_label("Gini")
+cbar.set_label("Gini", fontsize=CBAR_LABEL_SIZE)
 
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "heatmap_gini_mean.svg"), dpi=450)
 fig.savefig(os.path.join(OUTDIR, "heatmap_gini_mean.png"), dpi=450)
+fig.savefig(os.path.join(OUTDIR, "heatmap_gini_mean.pdf"), dpi=450)
+
+print("Saved to:", OUTDIR)
 # 不立即 plt.show()，让你统一在文件末尾 show
 plt.show()
 
-print("Saved to:", OUTDIR)
+
